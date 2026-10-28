@@ -75,3 +75,22 @@ GCC 16.2.0, Release:
 - Task 7: colour and fade control and the blocking-fade comparison (about 1.6 s
   handling delay) with simulated presses; the colours were not inspected by eye.
 - Extension: the atomic counts and `LDREX/STREX`, `LDAEX/STLEX` loops as described.
+
+
+## Task 3 review update
+
+The core recorder is now supplied. The required Task 3 edit is S1/S2 in
+`04-edges/race.c`: protect a shared read/clear without losing the injected event.
+The optional `_isr_exercise` target retains E1–E3. Task 4 still implements D1/D2;
+normal controller builds use that filter with the supplied ring.
+
+The race reports one before/after result per `x`, not the old supplied bad/protected
+pair. It rejects an un-restored interrupt mask or timed-out injection. The updated transfer passed host-model and cross-build checks. On the identified
+reference station, actual picolab monitor returned copied=1/remaining=0 before
+repair and copied=1/remaining=2 afterwards. An omitted restore returned INVALID
+and regular status reports continued. The board check used Release, SDK 2.3.1,
+GCC 16.2.0 at 150 MHz. Physical bounce and per-trial debounce observations remain
+pending; these controlled IRQ checks do not substitute for them.
+
+Bounce-analysis v2 requires explicit UART-burst selection and leaves ambiguous
+edge/marker associations unpaired. Its sampled gaps are not IRQ-entry latency.

@@ -38,6 +38,7 @@ void led_app_press(uint pin, uint64_t now) {
             fade_epoch = now;
             next_step = now;
         } else {
+            // TODO C1: implement the requested K2 stop policy.
             state = STEADY;
             brightness = PEAK;
         }

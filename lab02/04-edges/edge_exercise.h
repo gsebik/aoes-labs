@@ -1,4 +1,4 @@
-// Task 3: record one button edge from the GPIO interrupt into the ring.
+// Optional ISR-construction extension: record one button edge from the GPIO interrupt into the ring.
 //
 // The ISR owns head; main owns tail. A slot between tail and head belongs to
 // main until main advances tail. Keep this function short: no printing.

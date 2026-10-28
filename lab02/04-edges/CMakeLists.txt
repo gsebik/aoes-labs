@@ -10,10 +10,12 @@ endif()
 set(SHARED ${CMAKE_CURRENT_LIST_DIR}/../shared)
 
 add_executable(aoes_lab02_edges main.c race.c ${SHARED}/board.c)
+target_compile_definitions(aoes_lab02_edges PRIVATE EDGE_ISR_REFERENCE=1)
+add_executable(aoes_lab02_edges_isr_exercise main.c race.c ${SHARED}/board.c)
 add_executable(aoes_lab02_edges_recovery main.c race.c ${SHARED}/board.c)
 target_compile_definitions(aoes_lab02_edges_recovery PRIVATE EDGE_ISR_REFERENCE=1 DEBOUNCE_REFERENCE=1)
 
-foreach(target aoes_lab02_edges aoes_lab02_edges_recovery)
+foreach(target aoes_lab02_edges aoes_lab02_edges_isr_exercise aoes_lab02_edges_recovery)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${SHARED})
     target_link_libraries(${target} pico_stdlib hardware_timer hardware_irq
                                   hardware_sync hardware_clocks)

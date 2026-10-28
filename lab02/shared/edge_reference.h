@@ -1,5 +1,5 @@
-// Supplied recorder for the _recovery targets. Task 3 asks you to write this
-// function in edge_exercise.h; a recovery run does not complete Task 3.
+// Supplied recorder for the core lab: ISR owns head, main owns tail.
+// The optional _isr_exercise target uses edge_exercise.h instead.
 static void edge_isr(uint pin, uint32_t events) {
     if (pin != K1_PIN && pin != K2_PIN) return;
     uint32_t both = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;

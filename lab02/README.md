@@ -13,10 +13,11 @@ from the earlier directory, so nothing is copied by hand.
 | `01-relative/` | 1 | `aoes_lab02_relative` | `TODO R1` in `main.c` |
 | `02-absolute/` | 1 | `aoes_lab02_absolute` | `TODO A1/A2` in `main.c` |
 | `03-interrupt/` | 2 | `aoes_lab02_interrupt` | `TODO A1/A2/I1` in `main.c` |
-| `04-edges/` | 3–4 | `aoes_lab02_edges`, `_recovery` | `TODO E1–E3` in `edge_exercise.h`, `TODO D1–D2` in `debounce_exercise.h` |
+| `04-edges/` | 3–4 | `aoes_lab02_edges`, `_recovery` | `TODO S1/S2` in `race.c`, then `TODO D1/D2` in `debounce_exercise.h` |
 | `05-rgb/` | 5 | `aoes_lab02_rgb`, `_recovery` | `TODO W1/W2` in `waveform_exercise.c` |
 | `06-irq/` | 6 | `aoes_lab02_irq`, `_recovery` | none; compiles your `05-rgb` sender |
 | `07-controller/` | 7 | `aoes_lab02_controller`, `_recovery` | one change in `led_app.c`; compiles your `04-edges` and `05-rgb` code |
+| `04-edges/` | optional ISR extension | `aoes_lab02_edges_isr_exercise` | `TODO E1–E3` in `edge_exercise.h` |
 | `08-atomics/` | extension | `aoes_lab02_atomics` | none |
 | `shared/` | — | — | board setup and the supplied reference versions |
 | `tools/` | — | — | PC analysis and plotting, with tests |
@@ -39,12 +40,14 @@ Type a command character followed by Enter in the monitor (`x` in `04-edges`,
 An unfinished exercise fails to build with its `TODO` errors. A `_recovery` target
 builds the same program from the supplied reference in `shared/` (recorder,
 debounce rule and sender), so a group can continue while discussing the exercise.
-The banner says `recorder=recovery` or `sender=recovery`. A recovery run does not
-complete the exercise.
+The recorder banner says `recorder=supplied`; the filter banner says
+`filter=exercise` or `filter=recovery`. Sender banners identify `sender=student`
+or `sender=recovery`. A recovery filter does not complete Task 4.
+The core recorder supplies the ring and compiles without the optional ISR TODOs.
 
 ## Contracts
 
-- `04-edges/main.c [1]`, `edge_exercise.h`: one GPIO IRQ producer writes a ring
+- `04-edges/main.c [1]`, `shared/edge_reference.h`: one GPIO IRQ producer writes a ring
   of 256 slots (255 usable); the ISR owns `head` and publishes a slot by writing
   `head` last, main owns `tail` and releases a slot after copying it. Full means
   the newest edge is discarded and counted in `dropped`; a call with both edge
@@ -53,7 +56,10 @@ complete the exercise.
   timestamps. `eligible_us` is when the rule could first decide; `handled_us` is
   when main processed it.
 - `04-edges/race.c [R]`: a software-pended spare IRQ forces a known interleaving.
-  It is a demonstration, not a failure probability.
+  `take_pending_events` starts unsafe; students protect its transfer in S1/S2.
+  Injection leaves a request pending if masked and never waits inside that mask.
+  Missing mask restoration/timeouts produce INVALID and restore normal service.
+  This is a controlled test, not a natural failure probability or debounce rule.
 - `shared/sender_body.h [W]`: only the 24-bit waveform is inside the optional
   mask; GP17 brackets it and GP12 carries the data. The 400 µs reset guard is
   outside the mask. Sender targets use `-O2` and run the bit loop from SRAM.
@@ -81,8 +87,13 @@ python3 -m venv .venv
 |---|---|---|
 | `analyze_timing.py` | Task 1–2 UART logs | intervals and phase error |
 | `analyze_pins.py` | analyzer CSV (`time_s,chN`) | sampled levels and transition intervals |
-| `analyze_bounce.py` | one analyzer capture of GP14 + GP16, optional UART log | physical edges against ISR-recorded edges, edge-to-marker delay |
+| `analyze_bounce.py` | one analyzer capture of GP14 + GP16, optional UART log | sampled input edges against marker toggles; explicit optional UART-burst alignment |
 | `analyze_edges.py` | Task 3 UART log | press and release clusters, edge counts and spans |
 
-Call the virtual-environment interpreter by its full path (`~/aoes-labs/lab02/.venv/bin/python`):
-a relative path such as `../.venv/bin/python` makes Python print prefix warnings.
+From another project directory, use the lab environment's full path:
+`~/aoes-labs/lab02/.venv/bin/python`.
+
+Task 3 uses the normal `aoes_lab02_edges` with the initial pass-through filter:
+observe a press, diagnose and repair the shared-word transfer, then collect raw
+observations. Task 4 edits the filter. The optional `_isr_exercise` target uses
+`edge_exercise.h`; it is not a dependency of the controller.

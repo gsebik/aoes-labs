@@ -48,3 +48,21 @@ or inconsistent evidence rather than silently invent missing observations.
 
 `legacy_timing.py` is retained only to read old rc6 `window`/`timing,` captures.
 The current three timing projects use `analyze_timing.py`.
+
+
+## Compare a button capture
+
+`analyze_bounce.py` reads GP14 and GP16 samples from one press or release. It
+counts observed input transitions and recorder-marker toggles, and plots both.
+It reports a sampled gap only where one candidate input edge lies between
+marker toggles. Other associations remain unpaired; a gap is not an isolated
+IRQ-entry latency. Counts can differ because of peripheral coalescing, recorder
+loss, capture boundaries or analyzer resolution.
+
+An optional UART overlay requires `--uart` and an explicit `--uart-burst N`.
+The tool lists burst candidates if no selection is supplied, and rejects
+count/direction disagreement. The user must associate the selected burst with
+the actual action; aligning first records does not synchronize the clocks.
+JSON schema `aoes-lab02-bounce-v2` reports signed `sampled_edge_count_excess`
+and `unpaired_markers`, replacing the old `not_recorded` inference. Saved older
+captures remain usable; regenerate decoded bounce results with this version.

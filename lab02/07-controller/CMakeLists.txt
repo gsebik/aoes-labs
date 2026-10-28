@@ -10,7 +10,7 @@ endif()
 set(SHARED ${CMAKE_CURRENT_LIST_DIR}/../shared)
 
 add_executable(aoes_lab02_controller ../04-edges/main.c ../04-edges/race.c led_app.c ../05-rgb/waveform_exercise.c ${SHARED}/board.c)
-target_compile_definitions(aoes_lab02_controller PRIVATE LAB_WITH_RGB=1 LAB02_SENDER_NAME="student")
+target_compile_definitions(aoes_lab02_controller PRIVATE LAB_WITH_RGB=1 EDGE_ISR_REFERENCE=1 LAB02_SENDER_NAME="student")
 add_executable(aoes_lab02_controller_recovery ../04-edges/main.c ../04-edges/race.c led_app.c ${SHARED}/ws2812.c ${SHARED}/board.c)
 target_compile_definitions(aoes_lab02_controller_recovery PRIVATE LAB_WITH_RGB=1 EDGE_ISR_REFERENCE=1 DEBOUNCE_REFERENCE=1 LAB02_SENDER_NAME="recovery")
 

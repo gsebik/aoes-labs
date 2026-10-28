@@ -18,7 +18,7 @@ typedef struct {
 } button_t;
 static button_t buttons[2]; // Main-owned filter state.
 
-// [1] GPIO callback: the ISR side of the ring. The SDK has already
+// [1] Supplied GPIO recorder, or optional ISR-construction exercise. The SDK has already
 // acknowledged the delivered edge flags before it calls edge_isr.
 #ifdef EDGE_ISR_REFERENCE
 #include "edge_reference.h"
@@ -58,9 +58,14 @@ static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
 int main(void) {
     lab_board_init("events", true);
 #ifdef EDGE_ISR_REFERENCE
-    puts("recorder=recovery");
+    puts("recorder=supplied");
 #else
-    puts("recorder=student");
+    puts("recorder=isr-exercise");
+#endif
+#ifdef DEBOUNCE_REFERENCE
+    puts("filter=recovery");
+#else
+    puts("filter=exercise");
 #endif
     for (uint i = 0; i < 2; ++i) {
         buttons[i].stable = buttons[i].candidate = gpio_get(K1_PIN + i);
