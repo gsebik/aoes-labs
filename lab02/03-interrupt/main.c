@@ -25,7 +25,7 @@ int main(void) {
     const unsigned work_ms = 20;
     const uint64_t period_us = (uint64_t)period_ms * 1000;
     repeating_timer_t timer;
-    // I1: register heartbeat_cb with a negative period_ms interval here.
+    // TODO I1: register heartbeat_cb with a negative period_ms interval here.
 
     unsigned count = 0;
     uint64_t start_us = time_us_64();
@@ -33,7 +33,7 @@ int main(void) {
     puts("start,interrupt");
 
     while (true) {
-        if (false) { // A1: copy your deadline comparison from 02-absolute.
+        if (false) { // TODO A1: copy your deadline comparison from 02-absolute.
             gpio_xor_mask(1u << 16);
             uint64_t elapsed_us = time_us_64() - start_us;
             ++count;
@@ -41,7 +41,7 @@ int main(void) {
                    period_ms, work_ms, count,
                    (unsigned long long)elapsed_us, timer_count);
 
-            // A2: copy your next_us increment from 02-absolute.
+            // TODO A2: copy your next_us increment from 02-absolute.
             busy_wait_ms(work_ms);
         }
     }

@@ -1,17 +1,17 @@
-# Lab 2 source candidate — aoes-lab02-v1.0.0-rc7
+# Lab 2 source candidate — main
 
 Repository: https://github.com/gsebik/aoes-labs
 
-This tag is a review candidate. Retain its commit (`git rev-parse HEAD`), your
+This source is a review candidate. Retain its commit (`git rev-parse HEAD`), your
 source edits, build settings, ELF and raw observations together.
 
 ## Timing projects
 
 Tasks 1–2 use three independent projects under `lab02/`. Each has one `main.c`:
 
-- `01-relative`: implement R1, the wait before the GPIO change.
-- `02-absolute`: implement A1, the due check, and A2, the target increment.
-- `03-interrupt`: reuse your A1/A2 and implement I1, timer registration.
+- `01-relative`: implement `TODO R1`, the wait before the GPIO change.
+- `02-absolute`: implement `TODO A1`, the due check, and `TODO A2`, the target increment.
+- `03-interrupt`: reuse your `TODO A1/A2` and implement `TODO I1`, timer registration.
 
 The supplied placeholders compile. Their observed behaviour helps identify
 unfinished timing statements. Follow the manual's functional checks.

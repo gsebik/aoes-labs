@@ -139,13 +139,13 @@ these plots. Use `picolab la gui` to inspect and export captures interactively.
 Create a capture directory:
 
 ```sh
-mkdir -p captures
+mkdir -p ../lab02/captures
 ```
 
 Run the monitor through `tee` to retain what it prints, without guessing a port:
 
 ```sh
-picolab monitor | tee captures/edges.log
+picolab monitor | tee ../lab02/captures/edges.log
 ```
 
 One capture per reset. Start released, make deliberate presses/releases, then
@@ -154,7 +154,7 @@ before Ctrl+C. The monitor still accepts keyboard input through its stdin.
 The decoder ignores monitor banners and button/race messages.
 
 ```sh
-../lab02/.venv/bin/python ../lab02/tools/analyze_edges.py captures/edges.log --pin 14 --gap-ms 50 --json captures/edges.json --plot captures/edges.png
+../lab02/.venv/bin/python ../lab02/tools/analyze_edges.py ../lab02/captures/edges.log --pin 14 --gap-ms 50 --json ../lab02/captures/edges.json --plot ../lab02/captures/edges.png
 ```
 
 The grouping gap is an analysis assumption. The JSON retains cluster endpoints,

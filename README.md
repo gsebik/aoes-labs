@@ -40,7 +40,7 @@ lecturer; the startup banner identifies which executable is running.
 
 ## Reproducibility and status
 
-`aoes-lab02-v1.0.0-rc7` is a **review candidate**, not an unconditional hardware
+The current `main` is a **review candidate**, not an unconditional hardware
 qualification. See `lab02-events/release-card.md` for the exact verification
 scope. Builds, actual station measurements and physical button/colour observations
 are distinct evidence. Never use illustrative manual numbers as board results.

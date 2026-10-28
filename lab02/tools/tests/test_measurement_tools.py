@@ -12,6 +12,7 @@ def load(name):
     return module
 
 timing = load('analyze_timing')
+legacy = load('legacy_timing')
 pins = load('analyze_pins')
 
 HEADER = 'window mode=r half_period_us=500000 busy_iterations=5 work_us=0 callback_enabled=1\n'
@@ -21,23 +22,23 @@ def row(elapsed=1000100, main=2, irq=2, phase=100, work=0):
 
 class TimingTests(unittest.TestCase):
     def test_last_announced_window_is_explicit(self):
-        report = timing.analyze('monitor banner\n' + HEADER + row() + HEADER + row(2000200, 4, 4, 200))
+        report = legacy.analyze('monitor banner\n' + HEADER + row() + HEADER + row(2000200, 4, 4, 200))
         self.assertEqual(report['selected_window'], 2)
         self.assertEqual(report['summary']['main']['final_phase_us'], 200)
         self.assertEqual(len(report['rows']), 1)  # never invent intervening edges
-        self.assertEqual(timing.analyze(HEADER+row()+HEADER+row(), 1)['selected_window'], 1)
+        self.assertEqual(legacy.analyze(HEADER+row()+HEADER+row(), 1)['selected_window'], 1)
 
     def test_bad_or_inconsistent_records_fail(self):
         for data in (row(), HEADER, HEADER+'timing,garbled\n', HEADER+row(work=20),
                      HEADER+row()+row(100, 1, 1)):
             with self.subTest(data=data), self.assertRaises(ValueError):
-                timing.analyze(data)
+                legacy.analyze(data)
 
     def test_negative_phase_is_valid(self):
-        self.assertEqual(timing.analyze(HEADER+row(phase=-3))['summary']['main']['final_phase_us'], -3)
+        self.assertEqual(legacy.analyze(HEADER+row(phase=-3))['summary']['main']['final_phase_us'], -3)
 
     def test_disabled_callback_is_not_drawn_as_zero_latency(self):
-        report = timing.analyze(HEADER.replace('enabled=1', 'enabled=0')+row(irq=0))
+        report = legacy.analyze(HEADER.replace('enabled=1', 'enabled=0')+row(irq=0))
         self.assertIsNone(report['summary']['irq']['final_phase_us'])
 
     def test_observed_points_plot(self):
@@ -45,11 +46,11 @@ class TimingTests(unittest.TestCase):
             import matplotlib
         except ImportError:
             self.skipTest('optional matplotlib unavailable')
-        report = timing.analyze(HEADER + row() + row(2000200,4,4,200))
+        report = legacy.analyze(HEADER + row() + row(2000200,4,4,200))
         report['label'] = 'synthetic parser fixture, not board data'
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)/'plot.svg'
-            timing.plot([report], output)
+            legacy.plot([report], output)
             self.assertIn('<svg', output.read_text())
 
 class PinTests(unittest.TestCase):
@@ -79,6 +80,7 @@ class DirectLEDLogTests(unittest.TestCase):
         result=timing.analyze('led,relative,500,20,1,500000\nled,relative,500,20,2,1020000\n')
         self.assertEqual(result['schema'],'aoes-led-transitions-v1')
         self.assertEqual(result['summary']['main']['final_phase_us'],20000)
+        self.assertEqual(result['summary']['interval']['median_us'],520000)
     def test_callback_count_is_not_a_timestamp(self):
         result=timing.analyze('led,interrupt,500,650,1,500000,1\nled,interrupt,500,650,2,1150000,2\n')
         self.assertEqual(result['summary']['irq']['final_count'],2)
@@ -92,3 +94,27 @@ class DirectLEDLogTests(unittest.TestCase):
         result=timing.analyze('led,relative,500,0,9,4500000\nstart,absolute\nled,absolute,500,20,1,500001\n')
         self.assertEqual(result['settings']['experiment'],'absolute')
         self.assertEqual(len(result['rows']),1)
+
+    def test_missing_transition_does_not_invent_an_interval(self):
+        result = timing.analyze('led,absolute,500,0,1,500001\nled,absolute,500,0,3,1500001\n')
+        self.assertEqual(result['summary']['interval']['count'], 0)
+        self.assertIsNone(result['summary']['interval']['median_us'])
+
+    def test_current_transition_comparison_plot(self):
+        try:
+            import matplotlib
+        except ImportError:
+            self.skipTest('optional matplotlib unavailable')
+        reports = []
+        for kind, work, second in [('relative', 20, 1020000), ('interrupt', 650, 1150000)]:
+            suffix = ',1' if kind == 'interrupt' else ''
+            suffix2 = ',2' if kind == 'interrupt' else ''
+            text = (f'led,{kind},500,{work},1,500000{suffix}\n'
+                    f'led,{kind},500,{work},2,{second}{suffix2}\n')
+            report = timing.analyze(text)
+            report['label'] = kind + ' synthetic fixture, not board data'
+            reports.append(report)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'comparison.svg'
+            timing.plot(reports, output)
+            self.assertIn('Timer callback progress observed by main', output.read_text())

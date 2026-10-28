@@ -18,14 +18,14 @@ int main(void) {
     puts("start,absolute");
 
     while (true) {
-        if (false) { // A1: replace false with the deadline comparison.
+        if (false) { // TODO A1: replace false with the deadline comparison.
             gpio_xor_mask(1u << 16);
             uint64_t elapsed_us = time_us_64() - start_us;
             ++count;
             printf("led,absolute,%u,%u,%u,%llu\n",
                    period_ms, work_ms, count, (unsigned long long)elapsed_us);
 
-            // A2: advance next_us by one period_us here.
+            // TODO A2: advance next_us by one period_us here.
             busy_wait_ms(work_ms);
         }
     }

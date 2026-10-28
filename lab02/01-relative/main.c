@@ -16,7 +16,7 @@ int main(void) {
     puts("start,relative");
 
     while (true) {
-        // R1: wait period_ms milliseconds here.
+        // TODO R1: wait period_ms milliseconds here.
 
         gpio_xor_mask(1u << 16);
         uint64_t elapsed_us = time_us_64() - start_us;
