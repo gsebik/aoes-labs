@@ -11,7 +11,8 @@ for this revision. No nested repository or simulator is required to build this t
 From this directory, using the course SDK and `picolab` installation:
 
 ```sh
-picolab build aoes_timing --release-build
+export PICOLAB_BUILD_TYPE=Release
+picolab build aoes_timing
 picolab flash build/aoes_timing.elf
 picolab monitor
 ```

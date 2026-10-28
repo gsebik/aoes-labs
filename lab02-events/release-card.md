@@ -1,10 +1,10 @@
-# Lab 2 source candidate — aoes-lab02-v1.0.0-rc4
+# Lab 2 source candidate — aoes-lab02-v1.0.0-rc5
 
 Repository: https://github.com/gsebik/aoes-labs
 
 Clone this immutable tag and retain its commit (`git rev-parse HEAD`) with your
 measurements. This pack contains the Lab 2 starter, common helper, optional timing
-instrument, host analyzers and compatible picolab command helper. The course-site
+instrument, host analyzers. Use the existing station picolab installation. The course-site
 repository and private instructor completions are not dependencies.
 
 ## Build configuration
@@ -21,13 +21,15 @@ repository and private instructor completions are not dependencies.
 After completing the selected timing TODOs, from `lab02-events/`:
 
 ```sh
-picolab build aoes_lab02_timers --release-build
+picolab build aoes_lab02_timers
 picolab flash build/aoes_lab02_timers.elf
 picolab monitor
 ```
 
-The compatible helper is included at `../tools/picolab/picolab` if the installed
-copy lacks `--release-build`. It uses the same SDK/toolchain installation.
+Set `export PICOLAB_BUILD_TYPE=Release` once in the lab terminal before these
+commands. The existing installed picolab understands this setting; no tool
+upgrade or bundled helper is required. Debug inspection uses the existing
+`--debug-build` option, and subsequent normal builds return to Release.
 `n` then Enter restarts the observation window; mode/workload/callback remain
 compiled settings in timing_config.h. Record one minute after the fresh header
 for each of r0, a0, r20, a20 and b0. Keep separate logs and ELFs.
@@ -56,8 +58,9 @@ instructor, separately from this starter.
 
 A source tag identifies code, not an unconditional timing guarantee. The
 instructor's dated bench record lists actual SWD/UART/analyzer checks separately
-from builds. Physical K1/K2 trials, visual channel order and fitted LED revision
-must be confirmed before assigning this as a qualified teaching release.
+from builds. The live controller logs confirm K1/K2 events and application-state changes,
+but visible RGB output has not been confirmed. Pixel framing and the fitted LED
+revision remain under investigation and must be resolved before assigning this as a qualified teaching release.
 
 The analyzer can show physical GP16/GP17 transitions, and high-rate captures can
 measure GP12 pulses subject to sample resolution and clock uncertainty. UART

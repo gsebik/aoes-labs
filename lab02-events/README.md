@@ -21,21 +21,27 @@ default first target is `aoes_lab02_timers`; use explicit names throughout.
 
 ## Get the student source
 
-The pinned source candidate is `aoes-lab02-v1.0.0-rc4` in the public
+The pinned source candidate is `aoes-lab02-v1.0.0-rc5` in the public
 `gsebik/aoes-labs` repository. The course manual is linked from the root README.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc4 \
+git clone --depth 1 --branch aoes-lab02-v1.0.0-rc5 \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .
 ```
 
 Keep `../common/` beside the project. No course-document checkout, RTOS or nested
-repository is required. Complete the course station setup first. This pack also
-includes `../tools/picolab/`; its `--release-build` option explicitly selects
-Release after a Debug session. If your installed picolab predates that option,
-run `../tools/picolab/picolab` in place of `picolab`. The provided copy uses the same installed SDK, compiler and probe tools.
+repository is required. Complete the course station setup first. Use the already installed `picolab` from Environment Setup. No CLI or installer
+is bundled here. In the lab terminal, set the measurement build once:
+
+```sh
+export PICOLAB_BUILD_TYPE=Release
+```
+
+Repeat that setting when opening a new terminal. `picolab debug --debug-build`
+selects Debug only for its own invocation; later normal builds use this terminal's
+Release setting.
 
 ## Implement the timing versions
 
@@ -59,7 +65,7 @@ A relative wait is a duration; an absolute target is a clock timestamp.
 After implementing a stage, build and program its ELF:
 
 ```sh
-picolab build aoes_lab02_timers --release-build
+picolab build aoes_lab02_timers
 picolab flash build/aoes_lab02_timers.elf
 picolab monitor
 ```
@@ -87,14 +93,14 @@ packing and high-duration selection. `sender_body.h` supplies the explicit GPIO
 stores, SRAM bit loop and measurement mechanics.
 
 ```sh
-picolab build aoes_lab02_rgb --release-build
+picolab build aoes_lab02_rgb
 ```
 
 An unfinished exercise fails with W1/W2 errors. For recovery, use an explicitly
 named target and its matching ELF, for example:
 
 ```sh
-picolab build aoes_lab02_irq_recovery --release-build
+picolab build aoes_lab02_irq_recovery
 picolab flash build/aoes_lab02_irq_recovery.elf
 ```
 
