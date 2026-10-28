@@ -1,7 +1,7 @@
 #include "led_app.h"
 #include "ws2812.h"
 
-#define STEP_US 10000u
+#define STEP_US 62500u // 32 steps form a two-second up/down cycle.
 #define PEAK 16u
 
 typedef enum { STEADY, RAMP_UP, RAMP_DOWN } colour_state_t;
@@ -66,7 +66,7 @@ void led_app_blocking_fade(void) {
     for (uint phase = 0; phase < 2u * PEAK; ++phase) {
         brightness = phase <= PEAK ? phase : 2u * PEAK - phase;
         send_colour();
-        sleep_ms(10);
+        sleep_us(STEP_US);
     }
     brightness = PEAK;
     dirty = true;

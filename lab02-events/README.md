@@ -2,8 +2,8 @@
 
 Reference: EP-0172 + Pico 2 W, Arm/Core 0, Pico SDK, Gremlin SWD + UART0.
 This is a **review candidate**. The build matrix and automated station checks
-have been exercised; physical-button statistics, visual colour confirmation and
-the fitted LED revision still need acceptance. It is not an issued release pack.
+have been exercised, and the shorter-zero sender restored visible colour/fade
+control. Per-trial button statistics and wider classroom acceptance remain. It is not an issued release pack.
 
 ## Programs
 
@@ -21,27 +21,25 @@ default first target is `aoes_lab02_timers`; use explicit names throughout.
 
 ## Get the student source
 
-The pinned source candidate is `aoes-lab02-v1.0.0-rc5` in the public
+The pinned source candidate is `aoes-lab02-v1.0.0-rc6` in the public
 `gsebik/aoes-labs` repository. The course manual is linked from the root README.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc5 \
+git clone --depth 1 --branch aoes-lab02-v1.0.0-rc6 \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .
 ```
 
 Keep `../common/` beside the project. No course-document checkout, RTOS or nested
-repository is required. Complete the course station setup first. Use the already installed `picolab` from Environment Setup. No CLI or installer
-is bundled here. In the lab terminal, set the measurement build once:
+repository is required. Complete the course station setup first. Select Release once in the lab terminal:
 
 ```sh
 export PICOLAB_BUILD_TYPE=Release
 ```
 
-Repeat that setting when opening a new terminal. `picolab debug --debug-build`
-selects Debug only for its own invocation; later normal builds use this terminal's
-Release setting.
+Repeat that setting after opening a new terminal. The debugger's `--debug-build`
+selects Debug for that invocation; later normal builds return to Release.
 
 ## Implement the timing versions
 
@@ -154,8 +152,9 @@ Record the effective compiler flags and `clk_sys`; inspect the linked loop.
   The exclusive retry loop need not be wait-free. SDK initialization is retained.
 
 The fitted LED must be identified before pulse compliance is claimed. Current
-400/800 ns high and 1250 ns total targets refer to the cited classical WS2812B
-specification, not all package revisions. The reset guard is a 400 us design
+300/620/1200 ns CPU wait guards are calibrated for the reference build;
+they are not physical pulse specifications. Use the manual's WS2812B-V5 ranges
+and your sampled wire intervals. The reset guard is a 400 us design
 setting. A correct-looking colour does not establish pulse compliance. Changing
 clock, compiler, placement or timing constants requires a fresh wire capture.
 
@@ -165,7 +164,7 @@ The decoders use the Python standard library. Prepare the optional plotter once:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements-plots.txt
+.venv/bin/python -m pip install -r ../tools/lab02/requirements-plots.txt
 ```
 
 `analyze_timing.py` plots the five UART summary logs with `--json` and `--plot`.
@@ -199,7 +198,7 @@ before Ctrl+C. The monitor still accepts keyboard input through its stdin.
 The decoder ignores monitor banners and button/race messages.
 
 ```sh
-.venv/bin/python analyze_edges.py captures/edges.log --pin 14 --gap-ms 50 --json captures/edges.json --plot captures/edges.png
+.venv/bin/python ../tools/lab02/analyze_edges.py captures/edges.log --pin 14 --gap-ms 50 --json captures/edges.json --plot captures/edges.png
 ```
 
 The grouping gap is an analysis assumption. The JSON retains cluster endpoints,
@@ -225,7 +224,8 @@ instrument resolution. Validate all of the following on the reference board:
 
 The instructor walkthrough used this source on RP2350 with SDK 2.3.1/GCC 16.2.0:
 the timing comparisons, forced race/repair, RGB/IRQ captures, atomic counts and
-blocking-fade command were exercised. Those checks do not replace the physical
-button trials, visual colour check or fitted-part identification above. Keep
+blocking-fade command were exercised. The user confirmed visible colour/fade control with the corrected zero pulse.
+Those checks do not replace the per-trial physical button tests or fitted-part
+identification above. Keep
 this candidate under review until those remaining checks are recorded. Old
 experiments are not acceptance data for a different build.

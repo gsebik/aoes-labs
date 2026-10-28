@@ -10,7 +10,7 @@ Reference station: EP-0172 + Pico 2 W (RP2350 Arm/Core 0) + PicoGremlin, using
 SWD and UART0. Complete the manual's Environment Setup first.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc5 \
+git clone --depth 1 --branch aoes-lab02-v1.0.0-rc6 \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .
@@ -24,25 +24,23 @@ the timing target to compile. Student edits belong in source files, never in
 |---|---|
 | `lab02-events/` | Seven-task lab project, guided timing/waveform TODOs, analysis tools and tests |
 | `common/` | Shared elapsed-cycle helper |
-| `tools/timing/` | Optional cycle/period observation instrument and decoder |
+| `instruments/timing/` | Optional board firmware for cycle/period observations |
+| `tools/lab02/` | PC-side UART/logic-analyzer scripts, plotting dependencies and tests |
+| `tools/timing/` | PC-side decoder for the optional timing instrument |
 
-This repository contains no RTOS dependency, course-site checkout, private
-solutions or instructor acceptance completions. The normal waveform targets use
-the exercise; separately named `_recovery` programs let a group continue without
-mistaking recovery work for a completed exercise.
+The waveform targets use the student exercise. Separately named `_recovery`
+programs let a group continue while discussing an unfinished sender with the
+lecturer; the startup banner identifies which executable is running.
 
 ## Reproducibility and status
 
-`aoes-lab02-v1.0.0-rc5` is a **review candidate**, not an unconditional hardware
+`aoes-lab02-v1.0.0-rc6` is a **review candidate**, not an unconditional hardware
 qualification. See `lab02-events/release-card.md` for the exact verification
 scope. Builds, actual station measurements and physical button/colour observations
 are distinct evidence. Never use illustrative manual numbers as board results.
 
-The source in this repository is authoritative. The course documentation keeps a
-pinned mirror for its excerpts and material register; its source-check command
-compares this repository and the recorded release rather than accepting silent
-divergence. Student captures, build output and virtual environments are ignored.
+Retain the source revision, settings, ELF and raw captures together when comparing
+measurements. Captures, build output and virtual environments are ignored by Git.
 
-Authored code is MIT licensed. Use the existing lab-PC picolab installation;
-this repository contains no picolab installer or copy. The
+Authored code is MIT licensed. The
 separately installed picogremlin-la analyzer is GPL-3.0-only and is not vendored.

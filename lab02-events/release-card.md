@@ -1,4 +1,4 @@
-# Lab 2 source candidate — aoes-lab02-v1.0.0-rc5
+# Lab 2 source candidate — aoes-lab02-v1.0.0-rc6
 
 Repository: https://github.com/gsebik/aoes-labs
 
@@ -21,6 +21,7 @@ repository and private instructor completions are not dependencies.
 After completing the selected timing TODOs, from `lab02-events/`:
 
 ```sh
+export PICOLAB_BUILD_TYPE=Release
 picolab build aoes_lab02_timers
 picolab flash build/aoes_lab02_timers.elf
 picolab monitor
@@ -58,9 +59,12 @@ instructor, separately from this starter.
 
 A source tag identifies code, not an unconditional timing guarantee. The
 instructor's dated bench record lists actual SWD/UART/analyzer checks separately
-from builds. The live controller logs confirm K1/K2 events and application-state changes,
-but visible RGB output has not been confirmed. Pixel framing and the fitted LED
-revision remain under investigation and must be resolved before assigning this as a qualified teaching release.
+from builds. The user confirmed colour and brightness control after shortening the zero
+pulse. The final 24-bit build was then checked at 50 MS/s: zero HIGH about 320 ns,
+one HIGH about 640 ns, complete LOW portions 640–980 ns. The fade now uses
+62.5 ms steps for an approximately two-second up/down cycle. Per-trial debounce
+statistics and a wider classroom walkthrough remain to be reviewed before this
+candidate becomes a qualified teaching release.
 
 The analyzer can show physical GP16/GP17 transitions, and high-rate captures can
 measure GP12 pulses subject to sample resolution and clock uncertainty. UART

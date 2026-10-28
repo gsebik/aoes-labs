@@ -1,10 +1,7 @@
 # Shared timing harness — AoES Labs 2–4
 
-This is the student-facing adaptation of the course's worked
-`src/es201/l0-dwt-demo/` harness. It retains GPIO, timer and ADC investigations,
-uses the EP-0172 Gremlin UART workflow and gives each observation a precise name.
-The older source and its captures remain separate; they are not acceptance data
-for this revision. No nested repository or simulator is required to build this tool.
+Measure GPIO call brackets, callback periods and ADC call durations on the
+EP-0172 station. The table below defines the endpoints of each observation.
 
 ## Build and capture
 
@@ -24,7 +21,7 @@ still retain an entire run. Keep one complete `@@BEGIN` through `@@END` window,
 with all raw sample lines. There is no input-byte handshake.
 
 ```sh
-python3 decode.py captures/timing.log -o captures/timing.json
+python3 ../../tools/timing/decode.py captures/timing.log -o captures/timing.json
 ```
 
 The decoder selects the last complete run; `--run 2` selects a particular complete

@@ -10,7 +10,7 @@ void ws2812_init(void) {
     zero_cycles = (uint64_t)hz * WS2812_T0H_NS / 1000000000u;
     one_cycles = (uint64_t)hz * WS2812_T1H_NS / 1000000000u;
     bit_cycles = (uint64_t)hz * WS2812_BIT_NS / 1000000000u;
-    printf("sender targets_ns: zero_high=%u one_high=%u bit=%u reset_us=%u\n",
+    printf("sender wait_guards_ns: zero_high=%u one_high=%u cell=%u reset_us=%u\n",
            WS2812_T0H_NS, WS2812_T1H_NS, WS2812_BIT_NS, WS2812_RESET_US);
     busy_wait_us(WS2812_RESET_US);
 }

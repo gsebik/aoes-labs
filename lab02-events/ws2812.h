@@ -2,11 +2,12 @@
 #include "board.h"
 #include "hardware/structs/sio.h"
 
-// Design targets for the classical WS2812B timing table. These are not bench data.
-// Verify the fitted LED's specification and the actual pin waveform before release.
-#define WS2812_T0H_NS 400u
-#define WS2812_T1H_NS 800u
-#define WS2812_BIT_NS 1250u
+// CPU wait thresholds for the reference 150 MHz / O2 SRAM sender.
+// GPIO stores and loop overhead change physical widths; verify the pin capture.
+// WS2812B-V5 wire limits are in the manual; these constants are not those limits.
+#define WS2812_T0H_NS 300u
+#define WS2812_T1H_NS 620u
+#define WS2812_BIT_NS 1200u
 #define WS2812_RESET_US 400u
 
 typedef struct {
