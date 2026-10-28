@@ -1,0 +1,2 @@
+# UART/CSV decoding itself uses only the Python standard library.
+matplotlib>=3.6,<4

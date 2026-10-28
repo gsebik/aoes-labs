@@ -1,0 +1,2669 @@
+#!/usr/bin/env bash
+# picolab — the lab CLI shared by the es101 courses (AoES, EOS, ...): build, flash over
+# SWD via the PicoGremlin (or a Debug Probe), debug, and monitor Pico projects.
+# User help lives in usage() / usage_env() below:  picolab help   ·   picolab help env
+set -euo pipefail
+
+# picolab's own environment file, written by `install --tools` / `upgrade`. Sourcing it here
+# means an upgrade takes effect on the NEXT picolab command (no shell restart) and wins over a
+# stale exported PICO_SDK_PATH. Set PICOLAB_NO_ENV=1 for a one-off override.
+PICOLAB_ENV="${PICOLAB_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/picolab/env}"
+if [ "${PICOLAB_NO_ENV:-0}" != 1 ] && [ -f "$PICOLAB_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$PICOLAB_ENV"
+fi
+
+# Resolve through symlinks: `picolab install` puts a link in ~/.local/bin, and HERE must
+# still be tools/picolab in the course repo, not the link's directory.
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# The course repo picolab serves. Order: explicit PICOLAB_REPO, else the git root of the
+# current directory, else the legacy vendored layout (<repo>/tools/picolab). This lets
+# picolab live in its own repository and still work from a course checkout.
+REPO="${PICOLAB_REPO:-}"
+if [ -z "$REPO" ]; then
+    REPO="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+[ -n "$REPO" ] || REPO="$(cd "$HERE/../.." 2>/dev/null && pwd || echo "$HERE")"
+
+# A Pico project = a folder whose CMakeLists.txt calls pico_sdk_init().
+is_pico_project() { [ -f "$1/CMakeLists.txt" ] && grep -q 'pico_sdk_init' "$1/CMakeLists.txt"; }
+
+# The project you're standing in: $PWD or its nearest parent that is a Pico project.
+PROJ=""
+_d="$PWD"
+while [ "$_d" != "/" ]; do
+    if is_pico_project "$_d"; then PROJ="$_d"; break; fi
+    _d="$(dirname "$_d")"
+done
+
+# Course lab roots: folders whose sub-folders are lab projects (src/es201/l0-blink, ...).
+LAB_ROOTS=()
+if [ -n "${PICOLAB_LABS:-}" ]; then
+    IFS=: read -ra LAB_ROOTS <<< "$PICOLAB_LABS"
+else
+    # Standalone course source repositories put lab projects at their root.
+    for _d in "$REPO"/*/; do
+        if is_pico_project "$_d"; then LAB_ROOTS+=("$REPO"); break; fi
+    done
+    for _r in "$REPO"/src/*/; do
+        for _d in "$_r"*/; do
+            if is_pico_project "$_d"; then LAB_ROOTS+=("${_r%/}"); break; fi
+        done
+    done
+fi
+# How to name ourselves in hints: plain `picolab` once it's on PATH, else the path to it.
+if [ "$(command -v picolab 2>/dev/null | xargs -r readlink -f)" = "$HERE/picolab" ]; then
+    ME="picolab"
+else
+    ME="$HERE/picolab"; ME="${ME/#$PWD\//./}"
+fi
+# 2000 kHz, not the 5000 the Pi docs suggest: measured on the course probe (CMSIS-DAP
+# firmware 2.0.0, "Debug Probe + LogicAnalyzer"), 3 flash/read runs per step —
+#   5000 kHz: 3/3 failed | 4000: 3/3 failed | 3000, 2000, 1500, 1000: 0/3 failed
+# The break is in the *probe's USB link*, not the SWD wiring, and 2000 leaves margin.
+ADAPTER_SPEED="${ADAPTER_SPEED:-2000}"
+# The course probe ("Debug Probe (CMSIS-DAP) + LogicAnalyzer" firmware, CMSIS-DAP 2.0.0)
+# sometimes answers pipelined requests out of order: "command mismatch. Expected 0x6
+# received 0x5" = the reply to an EARLIER DAP_Transfer arriving where a DAP_TransferBlock
+# reply was due. That is independent of SWD speed — measured 2026-09-27 on one probe,
+# direct USB port: ~20-30% of flashes failed at 1000 AND 2000 kHz, one-shot or via the
+# server; with OpenOCD's quirk mode (one request in flight) 10/10 ok, ~0.6 s slower each.
+# It must be enabled after `init` — before it, this OpenOCD build segfaults.
+CMSIS_DAP_QUIRK="${CMSIS_DAP_QUIRK:-1}"
+OCD_QUIRK=(); OCD_QUIRK_SHOW=""
+if [ "$CMSIS_DAP_QUIRK" = 1 ]; then
+    OCD_QUIRK=(-c init -c "cmsis-dap quirk enable")
+    OCD_QUIRK_SHOW='-c init -c "cmsis-dap quirk enable"'
+fi
+BUILD_DIR=""   # set by build_target() to the lab's build/ dir
+
+# Print the exact tool command before running it. This script saves you typing; it
+# must never hide the toolchain — every "$ ..." line is copy-pasteable by hand.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then   # colour only on a terminal; NO_COLOR=1 turns it off
+    C_CMD=$'\e[1;36m' C_ERR=$'\e[1;31m' C_WARN=$'\e[33m' C_OK=$'\e[32m' C_OFF=$'\e[0m'
+    C_ORANGE=$'\e[1;38;5;208m' C_DIM=$'\e[2m' C_BOLD=$'\e[1m'
+else
+    C_CMD="" C_ERR="" C_WARN="" C_OK="" C_OFF="" C_ORANGE="" C_DIM="" C_BOLD=""
+fi
+show() {   # paths relative to where you ran it: $PWD/x -> x, and $PWD itself -> .
+    local c=" $* "; c="${c// $PWD / . }"; c="${c//$PWD\//}"; c="${c# }"; c="${c% }"
+    printf '%s$ %s%s\n' "$C_CMD" "$c" "$C_OFF"
+    if [ "$STEP" = 1 ]; then step_pause "$c"; fi
+}
+# --step / PICOLAB_STEP=1: before each real tool command, explain it (why_text) and ask.
+STEP="${PICOLAB_STEP:-0}"
+step_pause() {
+    local key; key="$(cmd_key "$1")" || return 0
+    why_text "$key"
+    [ -t 0 ] || return 0
+    local a
+    read -r -p "   ${C_BOLD}Enter${C_OFF} = run it   a = run the rest without stopping   q = stop here: " a
+    case "$a" in
+        q|Q) echo ">> stopped before running it."; exit 0 ;;
+        a|A) STEP=0 ;;
+    esac
+    echo
+}
+# Which tool step is this command? (keys for why_text)
+cmd_key() {
+    case "$1" in
+        *"gdb -q -batch"*)   echo flash-server ;;
+        *"gdb -q"*)          echo debug ;;
+        *openocd*program*)   echo flash ;;
+        *openocd*)           echo ocd ;;
+        *"cmake -S"*)        echo configure ;;
+        *"cmake --build"*)   echo build ;;
+        *serial-term*)       echo monitor ;;
+        *) return 1 ;;
+    esac
+}
+show_abs() { printf '%s$ %s%s\n' "$C_CMD" "$*" "$C_OFF"; }   # for commands that must be pasted with full paths (links)
+
+# Colour OpenOCD's log so the lines that matter stand out: errors red, warnings yellow,
+# and the ones that mean "this step worked" green. Also names the one misleading failure.
+ocd_color() {   # ocd_color [nohint|server]
+    # Colour OpenOCD's log (errors red, warnings yellow, "it worked" lines green) and name
+    # the two failures whose raw error walls explain nothing — each hint printed ONCE.
+    #   nohint : the caller explains the desync itself (one-shot flash)
+    #   server : a vanished/absent probe ends the stream with status 3, so the caller
+    #            can wait for the probe to come back and restart OpenOCD
+    local q=""; [ "$CMSIS_DAP_QUIRK" = 1 ] || q="put CMSIS_DAP_QUIRK=1 back (the default), "
+    local mm="   ^^ probe USB link desynced at $ADAPTER_SPEED kHz — the lines after this are symptoms, not causes. Just retry; if it keeps happening: ${q}try ADAPTER_SPEED=1000, replug the probe, use another USB port (no hub)"
+    local gone="   ^^ the probe DISAPPEARED from USB (unplugged, loose cable, or it reset). OpenOCD cannot reconnect to a device that went away — everything after this is fallout."
+    local none="   ^^ no probe found on USB — is it plugged in (USB-C cable to the PC)?"
+    # Ubuntu/Pop!_OS use mawk, which otherwise buffers piped input even though
+    # each output record is flushed below. Show startup messages immediately.
+    local live_awk=()
+    if awk -W version 2>&1 | grep -q '^mawk '; then live_awk=(-W interactive); fi
+    awk "${live_awk[@]}" -v E="$C_ERR" -v W="$C_WARN" -v O="$C_OK" -v X="$C_OFF" -v mode="${1:-}" \
+        -v mm="$mm" -v gone="$gone" -v none="$none" '
+    {
+        if ($0 ~ /^Error/)      print E $0 X
+        else if ($0 ~ /^Warn/)  print W $0 X
+        else if ($0 ~ /Examination succeed|Listening on port|accepting .gdb. connection|Programming Finished|Verified OK/) print O $0 X
+        else                    print
+        if (mode != "nohint" && $0 ~ /command mismatch/ && !m++) print E mm X
+        if ($0 ~ /No such device/ && !g++) { print E gone X; if (mode == "server") { fflush(); exit 3 } }
+        if ($0 ~ /unable to find a matching CMSIS-DAP device/ && !n++) { print E none X; if (mode == "server") { fflush(); exit 3 } }
+        fflush()
+    }'
+}
+
+# Is the probe on USB right now? (Raspberry Pi VID 2e8a: 000c Debug Probe, 0009 PicoGremlin firmware)
+probe_present() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = 2e8a ] || continue
+        case "$(cat "$d/idProduct" 2>/dev/null)" in
+            000c) return 0 ;;   # Debug Probe UART bridge
+            0009) # PID 0009 is also a plain Pico's console — only a probe if CMSIS-DAP
+                  grep -qiE 'cmsis|debug.probe' "$d/product" 2>/dev/null && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Is a long-running `picolab ocd` server up? Look for a listener on its telnet port
+# (4444) WITHOUT connecting: a connect-and-drop makes OpenOCD log a red
+# "Error: error during read: Connection reset by peer" that looks like a real failure.
+# (Never touch the GDB port either — OpenOCD would treat that as a debugger attaching.)
+ocd_server_up() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -Hltn 'sport = :4444' 2>/dev/null | grep -q .
+    else
+        (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null   # no ss: fall back to a connect
+    fi
+}
+# The pid listening on OpenOCD's telnet port — only if ss names it as openocd (never guess:
+# killing whatever else might hold 4444 would be worse than saying "do it yourself").
+ocd_server_pid() {
+    command -v ss >/dev/null 2>&1 || return 1
+    local out; out="$(ss -Hltnp 'sport = :4444' 2>/dev/null || true)"
+    case "$out" in *openocd*) ;; *) return 1 ;; esac
+    printf '%s\n' "$out" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+}
+
+# Prefer Ninja when present so CLI builds match the Pico VS Code extension (which ships its
+# own Ninja); fall back to CMake's default generator (Make) if ninja isn't installed.
+GEN_ARGS=(); command -v ninja >/dev/null 2>&1 && GEN_ARGS=(-G Ninja)
+
+# Find a ttyACM by USB PID: 0009 = Pico's own USB-CDC, 000c = Debug Probe UART bridge.
+#
+# PID alone is not always enough. Third-party probe firmware may claim 0009 too — the
+# course probe reports "Debug Probe (CMSIS-DAP) + LogicAnalyzer" on 2e8a:0009, the SAME
+# id as a Pico's own console — so a PID-only match can hand you the probe's port and
+# then sit there showing nothing, which looks exactly like dead firmware. Second arg
+# disambiguates by product string: 'probe' = only CMSIS-DAP/Debug-Probe products,
+# 'pico' = only everything else (i.e. a real target console), empty = don't care.
+find_acm_by_pid() {
+    local pid="$1" want="${2:-}" d p model
+    for d in /dev/ttyACM*; do
+        [ -e "$d" ] || continue
+        p="$(udevadm info -q property -n "$d" 2>/dev/null)"
+        echo "$p" | grep -qi 'ID_USB_VENDOR_ID=2e8a'    || continue
+        echo "$p" | grep -qEi "ID_USB_MODEL_ID=($pid)([^0-9a-f]|$)" || continue
+        model="$(echo "$p" | grep -m1 '^ID_USB_MODEL=' | cut -d= -f2)"
+        case "$want" in
+            probe) echo "$model" | grep -qiE 'cmsis|debug.probe' || continue ;;
+            pico)  echo "$model" | grep -qiE 'cmsis|debug.probe' && continue ;;
+        esac
+        echo "$d"; return 0
+    done
+    return 1
+}
+OCD_IFACE="interface/cmsis-dap.cfg"
+OCD_TARGET="target/rp2350.cfg"
+
+# If OPENOCD_SCRIPTS isn't exported, fall back to the Pi-fork install under ~/.pico-sdk.
+ocd_scripts_arg() {
+    [ -n "${OPENOCD_SCRIPTS:-}" ] && return
+    local d
+    # the Pico setup layout (<ver>/scripts) and a built-from-source layout
+    # (<prefix>/share/openocd/scripts) are both accepted
+    d=$(ls -d "$HOME"/.pico-sdk/openocd/*/scripts \
+              "$HOME"/.pico-sdk/openocd/*/share/openocd/scripts 2>/dev/null | head -1 || true)
+    [ -n "$d" ] && printf -- '-s\n%s\n' "$d"
+}
+
+# Find the openocd binary. Prefer one on PATH; otherwise fall back to the Pi-fork
+# install the Pico setup drops under ~/.pico-sdk (which isn't added to PATH). This
+# is why a bare `openocd` says "command not found" even though flashing works in
+# the official VS Code extension — it knows the absolute path; we resolve it here.
+openocd_bin() {
+    if command -v openocd >/dev/null 2>&1; then echo openocd; return; fi
+    local b
+    b=$(ls "$HOME"/.pico-sdk/openocd/*/openocd "$HOME"/.pico-sdk/openocd/*/bin/openocd 2>/dev/null | head -1 || true)
+    [ -n "$b" ] && { echo "$b"; return; }
+    echo "!! openocd not found — not on PATH and no ~/.pico-sdk/openocd/*[/bin]/openocd." >&2
+    echo "   Install it via the Pico setup, or put openocd on PATH." >&2
+    exit 1
+}
+
+# Same story for the ARM GDB: prefer one on PATH, else the Pico toolchain's. Debian/Ubuntu
+# ship it as gdb-multiarch, everyone else as arm-none-eabi-gdb — accept both, or the whole
+# debug/flash path dies on a machine whose `doctor` is all green (it knew both names).
+gdb_bin() {
+    if command -v arm-none-eabi-gdb >/dev/null 2>&1; then echo arm-none-eabi-gdb; return; fi
+    if command -v gdb-multiarch >/dev/null 2>&1; then echo gdb-multiarch; return; fi
+    local b
+    for b in "$HOME"/.pico-sdk/toolchain/*/bin/arm-none-eabi-gdb "$HOME"/.pico-sdk/toolchain/*/bin/gdb-multiarch; do
+        [ -x "$b" ] && { echo "$b"; return; }
+    done
+    echo "!! no ARM-capable GDB — need arm-none-eabi-gdb or gdb-multiarch on PATH (setup §1)." >&2
+    echo "   Debian/Ubuntu: sudo apt install gdb-multiarch · Arch: sudo pacman -S arm-none-eabi-gdb" >&2
+    exit 1
+}
+
+# PicoGremlin's logic-analyzer tools (`la`, from the separate picogremlin-la project — GPL,
+# its own installer). Same search order pg's doctor uses: PICOLAB_LA, PATH, shared venv,
+# pipx — so a bench and its firmware tests see the same install.
+la_bin() {
+    local b
+    [ -n "${PICOLAB_LA:-}" ] && [ -x "$PICOLAB_LA" ] && { echo "$PICOLAB_LA"; return 0; }
+    command -v la >/dev/null 2>&1 && { echo la; return 0; }
+    for b in "$HOME/.local/share/picogremlin/venv/bin/la" "$HOME"/.local/share/pipx/venvs/picogremlin-la/bin/la; do
+        [ -x "$b" ] && { echo "$b"; return 0; }
+    done
+    return 1
+}
+# A PicoGremlin specifically (CMSIS-DAP + logic analyzer): the only probe with an LA port.
+probe_has_la() {
+    local d
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = 2e8a ] || continue
+        grep -qiE 'logicanalyzer' "$d/product" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# Find picotool. The build already needs it (SDK 2.x runs it to make the .uf2), so it is
+# usually on PATH, or under the Pico setup's ~/.pico-sdk. Used by the probe-free flashing
+# path: plain USB, no SWD probe, no OpenOCD.
+picotool_bin() {
+    if command -v picotool >/dev/null 2>&1; then echo picotool; return 0; fi
+    local b
+    b=$(ls "$HOME"/.pico-sdk/picotool/*/picotool 2>/dev/null | head -1 || true)
+    [ -z "$b" ] && b=$(ls "$HOME"/.local/bin/picotool 2>/dev/null | head -1 || true)
+    [ -n "$b" ] && { echo "$b"; return 0; }
+    echo "!! picotool not found — needed for probe-free (UF2) flashing." >&2
+    return 1
+}
+
+# Does this picotool support device access? A build without libusb has no
+# load/save/reboot at all ("compiled without USB support") — it can still convert
+# .elf to .uf2, so SDK builds are fine, but `picolab flash --direct` cannot work.
+# Accepts a path or a bare command name (picotool_bin returns the name for display).
+picotool_has_usb() {
+    local pt="$1" out
+    case "$pt" in
+        */*) [ -x "$pt" ] || return 1 ;;
+        *)   pt="$(command -v "$pt" 2>/dev/null || true)"; [ -n "$pt" ] || return 1 ;;
+    esac
+    out="$("$pt" help 2>&1 || true)"
+    printf '%s' "$out" | grep -qi 'compiled without USB support' && return 1
+    printf '%s' "$out" | grep -qE '^[[:space:]]*load[[:space:]]' || return 1
+    return 0
+}
+
+# Building needs the Pico SDK. Fail early with copy-paste setup rather than letting
+# CMake error cryptically deep in pico_sdk_import.cmake.
+require_sdk() {
+    if [ -z "${PICO_SDK_PATH:-}" ]; then
+        echo "!! PICO_SDK_PATH is not set — the Pico SDK is required to build." >&2
+        echo "   Set it to your SDK checkout, e.g.:" >&2
+        echo "     export PICO_SDK_PATH=\"\$HOME/.pico-sdk/sdk/2.1.1\"   # the VS Code extension's SDK" >&2
+        echo "     export PICO_SDK_PATH=/path/to/pico-sdk              # a manual clone" >&2
+        echo "   (add that line to ~/.bashrc to make it permanent). See: $ME help env." >&2
+        exit 1
+    fi
+    if [ ! -f "$PICO_SDK_PATH/pico_sdk_init.cmake" ]; then
+        echo "!! PICO_SDK_PATH=\"$PICO_SDK_PATH\" doesn't look like a Pico SDK" >&2
+        echo "   (no pico_sdk_init.cmake there). Point it at your SDK checkout — see: $ME help env." >&2
+        exit 1
+    fi
+}
+
+# The FreeRTOS kernel L5 needs: env override, else the lib/ submodule. Two separate
+# checks, because the kernel keeps the RP2350 port in a *nested* submodule
+# (portable/ThirdParty/Community-Supported-Ports) — so a kernel checkout can be present
+# and still unusable, and that case needs different advice than "no kernel at all".
+freertos_kernel_dir() {
+    local k r cands=()
+    if [ -n "${FREERTOS_KERNEL_PATH:-}" ]; then cands=("$FREERTOS_KERNEL_PATH")
+    else for r in "${LAB_ROOTS[@]}"; do cands+=("$r/lib/FreeRTOS-Kernel"); done; fi
+    for k in "${cands[@]}"; do [ -f "$k/tasks.c" ] && { echo "$k"; return 0; }; done
+    return 1
+}
+
+# The course pins one kernel revision, and the ELF records it: the firmware prints
+# kernel=<version>, so a checkout at a different revision is a visible mismatch,
+# not a preference. A lab that genuinely needs another revision can say so with
+# FREERTOS_KERNEL_VERSION (the leading V is optional); every check and every
+# message then uses that value instead of the default.
+freertos_version_norm() {
+    local v="${1:-}"; v="${v#V}"; v="${v#v}"
+    printf 'V%s' "$v"
+}
+FREERTOS_PINNED="$(freertos_version_norm "${FREERTOS_KERNEL_VERSION:-11.3.1}")"
+# One checkout per revision: two courses can pin different kernels without either
+# one having to replace the other, and the path states what it contains.
+freertos_install_dir() { printf '%s' "$HOME/.pico-sdk/freertos/FreeRTOS-Kernel-${FREERTOS_PINNED}"; }
+freertos_kernel_version() {
+    local k; k="$(freertos_kernel_dir)" || return 1
+    sed -n 's/^#define[[:space:]]*tskKERNEL_VERSION_NUMBER[[:space:]]*"\(.*\)"/\1/p' \
+        "$k/include/task.h" 2>/dev/null | head -1
+}
+# Echoes the RP2350 ARM non-TrustZone port's import file. Candidate list mirrors the
+# probe in l5-freertos-tasks/CMakeLists.txt (the path moved between kernel releases).
+freertos_port_import() {
+    local k c; k="$(freertos_kernel_dir)" || return 1
+    for c in "$k/portable/ThirdParty/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake" \
+             "$k/portable/ThirdParty/Community-Supported-Ports/GCC/RP2350_ARM_NTZ/FreeRTOS_Kernel_import.cmake"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+# Every course lab folder (a Pico project directly under a lab root).
+lab_dirs() {
+    local r d
+    for r in "${LAB_ROOTS[@]}"; do
+        for d in "$r"/*/; do is_pico_project "$d" && echo "${d%/}"; done
+    done
+    return 0
+}
+# Their CMakeLists, plus the current project's — everything we search for targets/knobs.
+all_cmakes() {
+    local d
+    # `if`, not `[ ] && echo`: under set -e + pipefail a false test here would kill the script.
+    { lab_dirs; if [ -n "$PROJ" ]; then echo "$PROJ"; fi; } | sort -u | while read -r d; do echo "$d/CMakeLists.txt"; done
+}
+
+# A target is declared either directly, add_executable(<t> …), or via a lab's local
+# helper, add_lN_app(<t> …) (l4/l5 use one to avoid repeating stdio/output lines).
+TGT_RE='add_(executable|l[0-9]+_app)\('
+
+# Targets one project declares, in file order. `|| true`: no match is a normal result
+# (the caller reports "declares no add_executable"), not a reason to die under pipefail.
+targets_in() { { grep -oE "${TGT_RE}\s*[A-Za-z0-9_]+" "$1/CMakeLists.txt" 2>/dev/null | sed -E 's/.*\(\s*//'; } || true; }
+
+# target -> the course lab folder whose CMakeLists declares it.
+lab_dir_for() {
+    local f; for f in $(lab_dirs | sed 's|$|/CMakeLists.txt|'); do
+        grep -qE "${TGT_RE}\s*$1\b" "$f" && { dirname "$f"; return 0; }
+    done
+    return 0
+}
+
+list_targets() {
+    local d
+    for d in $(lab_dirs); do targets_in "$d" | sed "s|$| ${C_CMD}(${d#$REPO/})${C_OFF}|"; done | sort -u
+}
+
+# Recognised build knobs = the names in each lab's `foreach(opt ...)` (forwarded to
+# -D defines), plus PICO_BOARD. Used to catch typos in KEY=VAL args.
+known_knobs() {
+    { printf '%s\n' PICO_BOARD
+      # `|| true`: a project with no foreach(opt …) must not kill the script under
+      # `set -o pipefail` — grep exiting 1 (no match) is a normal result here.
+      { all_cmakes | xargs -r grep -hoE 'foreach\(opt[^)]*\)' 2>/dev/null \
+          | sed -E 's/foreach\(opt//; s/\)//' || true; }
+      # option(NAME "…" ON) declares a boolean knob; student commands name it too.
+      { all_cmakes | xargs -r grep -hoE 'option\([A-Za-z0-9_]+' 2>/dev/null \
+          | sed -E 's/option\(//' || true; }
+    } | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+# Which project + target a command means. Sets LAB and TARGET.
+#   no target          -> the project you're standing in (its first executable)
+#   target in project  -> that one
+#   otherwise          -> the course lab that declares it
+resolve_target() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        if [ -z "$PROJ" ]; then
+            echo "!! not inside a Pico project, and no target named." >&2
+            echo "   cd into a project folder (its CMakeLists.txt calls pico_sdk_init), or name a lab target: $ME list" >&2
+            echo "   (to compile-check every course lab at once: $ME build-all)" >&2
+            exit 2
+        fi
+        LAB="$PROJ"; TARGET="$(targets_in "$PROJ" | head -1)"
+        [ -n "$TARGET" ] || { echo "!! $PROJ/CMakeLists.txt declares no add_executable(...)" >&2; exit 1; }
+        n="$(targets_in "$PROJ" | wc -l)"
+        [ "$n" -le 1 ] || echo ">> $(basename "$PROJ") declares $n programs — using '$TARGET' (pick another: $ME build <name>)"
+    elif [ -n "$PROJ" ] && targets_in "$PROJ" | grep -qx "$t"; then
+        LAB="$PROJ"; TARGET="$t"
+    else
+        LAB="$(lab_dir_for "$t")"; TARGET="$t"
+        [ -n "$LAB" ] || { echo "!! unknown target '$t' — not in this project, nor in any course lab. See: $ME list" >&2; exit 1; }
+    fi
+}
+
+# Does <lab>/build need a fresh configure? When there is none, when defines change, or
+# when it can't be built on as-is. Three distinct broken states, each with its own
+# cryptic symptom on the *next* run:
+#   - configure died before project() -> no CMAKE_PROJECT_NAME -> "could not find CMAKE_PROJECT_NAME in Cache"
+#   - configure died after project()  -> cache but no generator file -> "ninja: error: loading 'build.ninja'"
+#     (what a failed picotool/pioasm version check leaves behind)
+#   - made by another generator (an old `mkdir build && cmake ..` = Make, while we use
+#     Ninja)                          -> "Does not match the generator used previously"
+needs_configure() {
+    local c="$1/build/CMakeCache.txt" want="Unix Makefiles"
+    [ "${#GEN_ARGS[@]}" -gt 0 ] && want="Ninja"
+    [ ! -f "$c" ] || [ "${#defs[@]}" -gt 0 ] && return 0
+    grep -q '^CMAKE_PROJECT_NAME' "$c" || return 0
+    [ -f "$1/build/build.ninja" ] || [ -f "$1/build/Makefile" ] || return 0
+    grep -qx "CMAKE_GENERATOR:INTERNAL=$want" "$c" || return 0
+    if [ -n "${PICOLAB_BUILD_TYPE:-}" ]; then grep -qx "CMAKE_BUILD_TYPE:STRING=$PICOLAB_BUILD_TYPE" "$c" || return 0; fi
+    return 1
+}
+configure_if_needed() {
+    local lab="$1"
+    needs_configure "$lab" || return 0
+    echo ">> configuring $(basename "$lab") (PICO_BOARD=${PICO_BOARD:-pico2_w})"
+    rm -rf "$lab/build"   # clean slate: never build on a half-configured or foreign cache
+    local bt=(); [ -n "${PICOLAB_BUILD_TYPE:-}" ] && bt=(-DCMAKE_BUILD_TYPE="$PICOLAB_BUILD_TYPE")
+    show cmake -S "$lab" -B "$lab/build" "${GEN_ARGS[@]}" ${PICO_BOARD:+-DPICO_BOARD=$PICO_BOARD} "${bt[@]}" "${defs[@]}"
+    [ -n "${PICOLAB_BUILD_TYPE:-}" ] && explain "CMAKE_BUILD_TYPE=$PICOLAB_BUILD_TYPE: Debug = -Og -g (every variable visible, steps follow the source); Release = -O3 (fast, but the debugger loses track)"
+    cmake -S "$lab" -B "$lab/build" "${GEN_ARGS[@]}" ${PICO_BOARD:+-DPICO_BOARD=$PICO_BOARD} "${bt[@]}" "${defs[@]}"
+}
+
+# Build one target inside its own project folder. Sets BUILD_DIR. Uses the global `defs`.
+build_target() {
+    local t lab
+    require_sdk
+    resolve_target "${1:-}"; t="$TARGET"; lab="$LAB"
+    configure_if_needed "$lab"
+    echo ">> building $t"
+    explain "cmake turned CMakeLists.txt into build rules in build/ (first time only); now the build tool recompiles changed .c files and links $t.elf (+ .uf2)"
+    local vb=(); [ "$VERBOSE" = 1 ] && vb=(--verbose)   # -v: every real gcc / ld line
+    show cmake --build "$lab/build" --target "$t" -j"$(nproc)" "${vb[@]}"
+    # If the target doesn't exist (e.g. an optional lab whose dependency is missing),
+    # cmake --build fails with an opaque message — give a targeted hint for the RTOS lab.
+    # Only hint when the dependency really is missing: printing "the kernel is missing" on
+    # an ordinary compile error in main_scope.c sends students down the wrong path.
+    if ! cmake --build "$lab/build" --target "$t" -j"$(nproc)" "${vb[@]}"; then
+        case "$(grep -c FreeRTOS "$lab/CMakeLists.txt" 2>/dev/null)" in
+            0|"") ;;
+            *)
+                if ! freertos_kernel_dir >/dev/null; then
+                    echo "!! '$t' not built — the FreeRTOS kernel is missing. See $lab/README.md (add the submodule or set FREERTOS_KERNEL_PATH), then retry."
+                elif ! freertos_port_import >/dev/null; then
+                    echo "!! '$t' not built — the kernel is there, but its RP2350 port is not: that port lives in a nested submodule. Get it with:"
+                    echo "     git -C \"$(freertos_kernel_dir)\" submodule update --init portable/ThirdParty/Community-Supported-Ports"
+                fi ;;
+        esac
+        # Missing CYW43 library: the header lives *with* the library, so linking it is
+        # what adds the include path. The most common Pico W networking-lab failure.
+        if grep -rq 'pico/cyw43_arch.h' "$lab"/*.c "$lab"/*.h 2>/dev/null \
+           && ! grep -q 'pico_cyw43_arch' "$lab/CMakeLists.txt" 2>/dev/null; then
+            echo "!! the CYW43 driver is not linked: the code includes pico/cyw43_arch.h, but"
+            echo "   CMakeLists.txt has no pico_cyw43_arch_* library in target_link_libraries. Add:"
+            echo "     pico_cyw43_arch_lwip_sys_freertos   # Wi-Fi + lwIP + CYW43 (the networking lab)"
+            echo "     pico_cyw43_arch_none                # radio driver only (the onboard LED)"
+        fi
+        exit 1
+    fi
+    BUILD_DIR="$lab/build"
+    build_summary "$lab" "$t"
+}
+
+# After a build: which file came out, when, and how big — so "what will I flash?" has
+# an answer you can see before flashing anything.
+build_summary() {
+    local elf sz; elf="$(find "$1/build" -name "$2.elf" -print -quit)"
+    [ -n "$elf" ] || return 0
+    echo "${C_OK}>> built${C_OFF} ${elf#$PWD/}   ($(date -r "$elf" '+%H:%M:%S'))"
+    if sz="$(size_bin)"; then
+        show "$sz" "$elf"; "$sz" "$elf" | sed 's/^/   /'
+        explain "text = code + constants (flash) · data = initialised globals (stored in flash, copied to RAM at boot) · bss = zeroed globals (RAM)"
+    fi
+    if [ "$cmd" = build ]; then
+        echo "   next: $ME flash --no-build   flash exactly this file  ·  $ME debug --no-build   debug it"
+    fi
+}
+size_bin() {
+    if command -v arm-none-eabi-size >/dev/null 2>&1; then echo arm-none-eabi-size; return; fi
+    local b; b=$(ls "$HOME"/.pico-sdk/toolchain/*/bin/arm-none-eabi-size 2>/dev/null | head -1 || true)
+    [ -n "$b" ] && echo "$b"
+}
+
+# Is the build behind the sources? Asks the build tool itself (dry run), so it knows
+# about headers and CMakeLists changes too — not a guess from file times.
+build_is_stale() {   # build_is_stale <lab> <target>  → true if building would change something
+    local b="$1/build"
+    if [ -f "$b/build.ninja" ]; then
+        ninja -C "$b" -n "$2" 2>/dev/null | grep -q '^\['
+    elif [ -f "$b/Makefile" ]; then
+        ! make -C "$b" -q "$2" >/dev/null 2>&1
+    else return 0; fi
+}
+
+# Which image do flash / debug use? Sets ELF (and BUILD_DIR for the GDB scripts).
+#   picolab flash             1/2 build (only what changed), 2/2 flash the result
+#   picolab flash --no-build  the existing build as it is — checked against the sources first
+#   picolab flash x.elf       exactly that file: no project, no build
+pick_elf() {
+    local arg="${1:-}" verb="$2" a
+    case "$arg" in
+        *.elf|*.hex|*.bin|*.uf2)
+            [ -f "$arg" ] || { echo "${C_ERR}!! no such file: $arg${C_OFF}" >&2; exit 1; }
+            ELF="$(readlink -f "$arg")"
+            BUILD_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/picolab"; mkdir -p "$BUILD_DIR"   # GDB scripts, not next to your file
+            echo "${C_BOLD}== $verb ${arg} — the file you named, as it is (nothing is built) ==${C_OFF}"
+            echo "   (file dated $(date -r "$ELF" '+%Y-%m-%d %H:%M:%S'))"
+            return ;;
+    esac
+    if [ "$NOBUILD" = 1 ]; then
+        resolve_target "$arg"; BUILD_DIR="$LAB/build"
+        ELF="$(find "$BUILD_DIR" -name "${TARGET}.elf" -print -quit 2>/dev/null)"
+        [ -n "$ELF" ] || { echo "${C_ERR}!! no build of $TARGET yet — run: $ME build${C_OFF}" >&2; exit 1; }
+        echo "${C_BOLD}== $verb ${ELF#$PWD/} — --no-build: the existing build, as it is ==${C_OFF}"
+        if build_is_stale "$LAB" "$TARGET"; then
+            echo "${C_ORANGE}!! this build is OLDER than your sources — you would $verb the PREVIOUS version of your code.${C_OFF}"
+            echo "   ($ME build first, or drop --no-build to build and $verb in one go)"
+            if [ -t 0 ]; then
+                read -r -p "   $verb the old build anyway? [y/N] " a
+                case "$a" in y|Y) ;; *) echo ">> stopped — nothing was flashed."; exit 1 ;; esac
+            fi
+        else
+            echo "   ${C_OK}up to date${C_OFF} with your sources ($(date -r "$ELF" '+built %H:%M:%S'))"
+        fi
+        return
+    fi
+    echo "${C_BOLD}== 1/2  build (only what changed since the last build) ==${C_OFF}"
+    build_target "$arg"
+    ELF="$(find "$BUILD_DIR" -name "${TARGET}.elf" -print -quit)"
+    [ -n "$ELF" ] || { echo "!! built, but no ${TARGET}.elf found under $BUILD_DIR"; exit 1; }
+    echo; echo "${C_BOLD}== 2/2  $verb ${ELF#$PWD/} ==${C_OFF}"
+}
+
+build_all() {
+    local lab
+    require_sdk
+    for lab in $(lab_dirs); do
+        echo ">> === ${lab#$REPO/} ==="
+        configure_if_needed "$lab" >/dev/null
+        show cmake --build "$lab/build" -j"$(nproc)"
+        cmake --build "$lab/build" -j"$(nproc)"
+    done
+}
+
+# Program a single image file onto the chip over SWD, then verify, reset and run.
+# OpenOCD's `program` autodetects ELF/HEX/BIN — but NOT .uf2 (that's the BOOTSEL
+# mass-storage format; flash it by dragging to the RP2350 drive or `picotool load`).
+program_image() {
+    local img="$1"
+    case "$img" in
+        *.uf2) echo "!! OpenOCD can't program a .uf2 over SWD — that's the BOOTSEL format." >&2
+               echo "   Use the probe-free path instead:  $ME flash --direct \"$img\"" >&2
+               echo "   (or drag the .uf2 to the RP2350 drive; to flash over SWD, pass the .elf/.hex)." >&2
+               exit 2 ;;
+    esac
+    [ -f "$img" ] || { echo "!! no such file: $img" >&2; exit 1; }
+    # A `picolab ocd` server already owns the probe — go through it instead of starting
+    # a second OpenOCD (which would fail: only one program can hold the probe).
+    if ocd_server_up; then
+        case "$img" in
+            *.elf) flash_via_server "$img"; return ;;
+            *) echo "!! the OpenOCD server ($ME ocd) holds the probe — flash the .elf through it," >&2
+               echo "   or stop the server (Ctrl-C in its terminal) to program $img directly." >&2
+               exit 1 ;;
+        esac
+    fi
+    echo ">> flashing $img over SWD at $ADAPTER_SPEED kHz (the Pico must be powered)"
+    explain "OpenOCD drives the 2 SWD wires through the probe: halts the RP2350, erases + writes the .elf into its flash, reads it back to verify, resets — your program starts"
+    local s=(); mapfile -t s < <(ocd_scripts_arg)
+    # Tee the log so we can recognise one specific failure and name it. When the probe's
+    # USB link desyncs, OpenOCD reports a *misleading* chain: "CMSIS-DAP command mismatch"
+    # (the real cause), then "Failed to read memory at 0x2001xxxx", then "Could not
+    # allocate stack for flash programming code -- insufficient space" — which reads like
+    # the chip is out of RAM when in fact the read that sizes the RAM came back corrupt.
+    # OpenOCD 0.12 may then segfault (exit 139). Too high a speed is one cause; on the
+    # course probe, out-of-order replies are another — CMSIS_DAP_QUIRK=1 (default) fixes those.
+    local log rc=0; log="$(mktemp)"
+    show "$(openocd_bin)" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET" \
+        -c "\"adapter speed $ADAPTER_SPEED\"" $OCD_QUIRK_SHOW -c "\"program $img verify reset exit\""
+    set +e
+    "$(openocd_bin)" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET" \
+        -c "adapter speed $ADAPTER_SPEED" "${OCD_QUIRK[@]}" \
+        -c "program \"$img\" verify reset exit" 2>&1 | tee "$log" | ocd_color nohint
+    rc=${PIPESTATUS[0]}
+    set -e
+    if grep -q "command mismatch" "$log"; then
+        echo "!! The probe's USB link desynced at $ADAPTER_SPEED kHz — that is what the errors above" >&2
+        echo "   really mean (the \"insufficient space\" line is a symptom, not a RAM problem)." >&2
+        echo "   Retry slower, e.g.:  ADAPTER_SPEED=2000 $ME flash $(basename "${img%.elf}")" >&2
+        echo "   If even 1000 kHz desyncs: replug the probe, and check nothing else has it open" >&2
+        echo "   (a leftover openocd, or a simulator/IDE hardware-debug session)." >&2
+    fi
+    rm -f "$log"
+    [ "$rc" -eq 0 ] || exit "$rc"
+}
+
+# Echo picotool device-selection args (--bus N --address N) for the TARGET device.
+# The Debug Probe/PicoGremlin is itself an RP-series device on 2e8a, so with both on USB
+# an unqualified `picotool load -f` refuses: "requires a single RP-series device".
+# Pick the RP-series device whose product string is NOT the CMSIS-DAP probe. Returns
+# non-zero (no args) when there is not exactly one such device.
+# USB devices that could be a *target* board for picotool — every RP-series device EXCEPT
+# the debug probe. One line each: <bus> <devnum> <pid> <product> (tab-separated). Probes
+# are recognised by product name; the PIDs are the RP-series ones (000a included: an
+# RP2040 console is still a target, never a probe).
+rp_targets() {
+    local d v model
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = 2e8a ] || continue
+        v="$(cat "$d/idProduct" 2>/dev/null)"
+        case "$v" in 0003|0004|0005|0009|000a|000c|000f) ;; *) continue ;; esac   # RP-series PIDs
+        model="$(cat "$d/product" 2>/dev/null || true)"
+        printf '%s' "$model" | grep -qiE 'cmsis|debug.probe|logicanalyzer' && continue
+        printf '%s\t%s\t%s\t%s\n' "$(cat "$d/busnum" 2>/dev/null)" "$(cat "$d/devnum" 2>/dev/null)" "$v" "$model"
+    done
+}
+# The single target board on USB, as picotool's --bus/--address selection: prints it and
+# returns 0; 1 when there is none; 2 when several are attached. `picotool load` is NEVER
+# run without this selection — the probe answers picotool too (runtime-reset interface),
+# so with no target pinned picotool would flash the debugger itself.
+picotool_target_args() {
+    local found=() b a; mapfile -t found < <(rp_targets)
+    case "${#found[@]}" in
+        1) IFS=$'\t' read -r b a _ <<<"${found[0]}"; printf -- '--bus\n%s\n--address\n%s\n' "$b" "$a"; return 0 ;;
+        0) return 1 ;;
+        *) return 2 ;;
+    esac
+}
+
+# Which RP chip is the target board on USB? Prints rp2040 | rp2350 | nothing. Uses the same
+# probe-excluding scan, so the family check can never read the probe by mistake.
+# PIDs: 0003/0004/000a = RP2040 family; 000f/0005/0009 = RP2350.
+usb_board_family() {
+    local found=() pid; mapfile -t found < <(rp_targets)
+    [ "${#found[@]}" -gt 0 ] || return 1
+    IFS=$'\t' read -r _ _ pid _ <<<"${found[0]}"
+    case "$pid" in
+        0003|0004|000a) echo rp2040 ;;
+        000f|0005|0009) echo rp2350 ;;
+    esac
+}
+# Board name -> chip family (PICO_BOARD values).
+board_family() {
+    case "$1" in
+        pico2*)      echo rp2350 ;;
+        pico|pico_w) echo rp2040 ;;
+        *)           echo "" ;;
+    esac
+}
+
+# Probe-free flashing: no SWD probe, no OpenOCD. picotool talks to the chip over plain USB.
+# With -f it can reboot a board that is already running a USB-stdio program into the
+# bootloader by itself (picotool >= 1.1, no BOOTSEL button needed); -x runs the new image
+# afterwards. Accepts .uf2, .elf, .hex or .bin.
+flash_no_probe() {
+    local img="$1" pt; local -a sel=()
+    [ -f "$img" ] || { echo "!! no such file: $img" >&2; exit 1; }
+    if ! pt="$(picotool_bin)"; then
+        case "$img" in
+            *.uf2) echo "   fallback: hold BOOTSEL, replug, then drag \"$img\" to the RP2350 drive." >&2 ;;
+            *)     echo "   fallback: drag the matching .uf2 to the RP2350 drive (hold BOOTSEL, replug)." >&2 ;;
+        esac
+        exit 1
+    fi
+    if ! picotool_has_usb "$pt"; then
+        echo "!! this picotool was compiled WITHOUT USB support — it cannot flash anything." >&2
+        echo "   Fix it (installs the libusb headers and rebuilds picotool):  $ME doctor --fix" >&2
+        echo "   ...or flash by hand: hold BOOTSEL, replug, drag the .uf2 to the RP2350 drive." >&2
+        exit 1
+    fi
+    # Firmware/board mismatch: an RP2350 image cannot boot on an RP2040 (or vice versa) —
+    # the board just stays in BOOTSEL and no serial port appears. Catch it before writing.
+    local want_board="" want_fam="" have_fam=""
+    if [ -n "${BUILD_DIR:-}" ] && [ -f "$BUILD_DIR/CMakeCache.txt" ]; then
+        want_board="$(sed -n 's/^PICO_BOARD:STRING=//p' "$BUILD_DIR/CMakeCache.txt" | head -1)"
+        want_fam="$(board_family "$want_board")"
+    fi
+    have_fam="$(usb_board_family || true)"
+    if [ -n "$want_fam" ] && [ -n "$have_fam" ] && [ "$want_fam" != "$have_fam" ]; then
+        echo "!! firmware/board mismatch: this image is built for PICO_BOARD=${want_board:-?} ($want_fam)," >&2
+        echo "   but the board on USB is an $have_fam. That image cannot boot there — the board" >&2
+        echo "   just stays in BOOTSEL, and no serial port appears." >&2
+        case "$have_fam" in
+            rp2040) echo "   Rebuild for this board:  $ME build <lab> PICO_BOARD=pico   (then flash again)" >&2 ;;
+            rp2350) echo "   Rebuild for this board:  $ME build <lab> PICO_BOARD=pico2_w   (then flash again)" >&2 ;;
+        esac
+        echo "   ...or connect the board the firmware was built for." >&2
+        exit 1
+    fi
+    # Pre-check WHICH board picotool will get, and never run an unqualified `load`: the
+    # probe answers picotool too while its firmware runs (runtime-reset interface), so with
+    # no target pinned picotool would flash the debugger itself.  Exactly one target -> pin
+    # it with --bus/--address (-f must follow them, see the probe-free test); none, or
+    # several -> stop here and say what to do.
+    local sel_out="" sel_rc=0
+    sel_out="$(picotool_target_args)" || sel_rc=$?
+    if [ "$sel_rc" = 1 ]; then
+        if probe_present; then
+            echo "!! no target board on USB — only the debug probe is connected, and picolab" >&2
+            echo "   never flashes the debugger.  Plug the target Pico's own USB cable in" >&2
+            echo "   (running or in BOOTSEL), then retry." >&2
+            echo "   (To update the probe's own firmware, use its repo's './pg flash'.)" >&2
+        else
+            echo "!! no target board found on USB — plug the Pico's own USB cable in" >&2
+            echo "   (running or in BOOTSEL), then retry." >&2
+        fi
+        exit 1
+    elif [ "$sel_rc" = 2 ]; then
+        echo "!! several RP-series boards are on USB — picotool needs exactly one target:" >&2
+        while read -r b a pid prod; do
+            echo "   bus $b, address $a  ($prod)" >&2
+        done < <(rp_targets)
+        echo "   Unplug the extras, then retry." >&2
+        exit 1
+    fi
+    [ -n "$sel_out" ] && mapfile -t sel <<<"$sel_out"
+    echo ">> flashing $img with picotool over USB (no debug probe)"
+    [ "${#sel[@]}" -gt 0 ] && echo "   target: ${sel[*]}"
+    explain "picotool reboots the chip into its bootloader if needed (-f), writes the image over USB, then starts it (-x) — no SWD, no OpenOCD, no probe"
+    show "$pt" load "${sel[@]}" -f -x "$img"
+    if ! "$pt" load "${sel[@]}" -f -x "$img"; then
+        # No udev rule yet? The board is in BOOTSEL and its mass-storage drive is usually
+        # mounted — copying the .uf2 there is the same flash by hand. Try that before
+        # failing. PICOLAB_BOOTSEL overrides the search (tests, unusual mount points).
+        local uf2="" mnt="" m u; u="${USER:-$(id -un)}"
+        uf2="$(ls "${img%.*}.uf2" 2>/dev/null | head -1 || true)"
+        for m in "${PICOLAB_BOOTSEL:-}" "/media/$u/RP2350" "/media/$u/RPI-RP2" \
+                 "/run/media/$u/RP2350" "/run/media/$u/RPI-RP2" "/mnt/RP2350" "/mnt/RPI-RP2"; do
+            [ -n "$m" ] && [ -d "$m" ] && { mnt="$m"; break; }
+        done
+        if [ -n "$uf2" ] && [ -n "$mnt" ]; then
+            echo ">> picotool could not open the device — falling back to the mounted BOOTSEL drive"
+            show cp "$uf2" "$mnt/"
+            if cp "$uf2" "$mnt/"; then
+                echo "${C_OK}>> copied to $mnt — the board reboots and runs it.${C_OFF}"
+                echo "   (the permanent fix for picotool is the udev rule: $ME doctor --fix)"
+                return 0
+            fi
+        fi
+        echo "${C_ERR}!! picotool could not flash.${C_OFF}" >&2
+        echo "   If it said 'unable to connect ... permissions', install the udev rule (setup §4):" >&2
+        echo "     $ME doctor --fix     # the 'Pico permission' fix; no replug needed" >&2
+        echo "   ...or apply it to the connected device right now:" >&2
+        echo "     sudo udevadm control --reload-rules && sudo udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=2e8a" >&2
+        echo "   Otherwise, if the board is unresponsive or its USB interface is not one picotool" >&2
+        echo "   can talk to, enter BOOTSEL by hand: hold BOOTSEL, tap RUN / replug, then drag the" >&2
+        echo "   .uf2 to the RP2350 mass-storage drive.${C_OFF}" >&2
+        exit 1
+    fi
+}
+
+# GDB commands go in a script file next to the build, not in -ex flags: a command file
+# STOPS at its first error, while -ex flags carry on past it — so a failed `load` would
+# still reach `break main` and leave you stepping the OLD firmware without noticing.
+# The file is also the recipe, readable: `cat <lab>/build/debug.gdb`.
+gdb_script() {   # gdb_script <file> <gdb command>...   — write it, and show it
+    local f="$1"; shift
+    printf '%s\n' "$@" > "$f"
+    sed "s/^/      ${C_CMD}|${C_OFF} /" "$f"
+}
+
+flash_via_server() {
+    local elf="$1" gs="$BUILD_DIR/flash.gdb" gdb
+    gdb="$(gdb_bin)"
+    echo ">> flashing $elf through the running OpenOCD server — its terminal shows the SWD side"
+    explain "GDB connects to the server (port 3333) and 'load' sends the .elf; OpenOCD writes it into flash over SWD, then the chip is reset and GDB lets go"
+    show "$gdb" -q -batch "$elf" -x "$gs"
+    gdb_script "$gs" "target extended-remote localhost:3333" "monitor reset halt" \
+                     "load" "monitor reset run" "detach"
+    if ! "$gdb" -q -batch "$elf" -x "$gs"; then
+        echo "${C_ERR}!! flashing through the OpenOCD server failed — your new build is NOT on the board" >&2
+        echo "   (it holds the old firmware, or a half-written image if the erase/write got partway)." >&2
+        echo "   Trust the FIRST error above, and check the server's terminal for the SWD-side reason.${C_OFF}" >&2
+        exit 1
+    fi
+}
+
+# Long-running OpenOCD server for the two-terminal workflow: leave it open in one
+# terminal (it shows the probe, SWD, GDB connections, flashing, errors), and run
+# build/flash/debug in another — those detect it and connect to it instead of
+# starting their own OpenOCD.
+# ── picosim-bridge ────────────────────────────────────────────────────────────
+# The course web page runs on the lab server, which cannot reach your USB. The browser
+# can: it connects to this tiny local relay, which forwards to OpenOCD here. So the same
+# in-browser debugger drives the board without exposing this machine to the network.
+bridge_bin() {
+    local c
+    [ -n "${PICOLAB_BRIDGE:-}" ] && [ -x "$PICOLAB_BRIDGE" ] && { printf '%s' "$PICOLAB_BRIDGE"; return 0; }
+    for c in picosim-bridge "$HOME/.local/bin/picosim-bridge"; do
+        if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+BRIDGE_UP=""
+start_bridge() {
+    local b port
+    port="${PICOLAB_BRIDGE_PORT:-8092}"
+    if ! b="$(bridge_bin)"; then
+        echo "   bridge: not installed — the web page can't reach the board from the browser"
+        echo "           install it with:  $ME install --bridge   (or set PICOLAB_BRIDGE=/path/to/picosim-bridge)"
+        return 0
+    fi
+    # One bridge per machine: reuse one that is already listening.
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+        echo "   bridge: already running on ws://127.0.0.1:$port"
+        return 0
+    fi
+    "$b" --port "$port" >"$PL_CACHE/bridge.log" 2>&1 &
+    BRIDGE_UP=$!
+    explain "picosim-bridge is a local WebSocket relay: the course web page (in your browser) connects to it and it talks to OpenOCD here — that is how the board is debugged in the browser without exposing this machine"
+    echo "   bridge: ws://127.0.0.1:$port  (for the course web page)  pid $BRIDGE_UP"
+}
+
+stop_bridge() {
+    if [ -n "$BRIDGE_UP" ]; then kill "$BRIDGE_UP" 2>/dev/null || true; fi
+    BRIDGE_UP=""
+}
+
+ocd_server() {
+    if ocd_server_up; then
+        # A server is already listening — usually the student's other terminal, or one left
+        # behind by a crash. "Use that one" made people hunt for a terminal; instead offer
+        # to take over HERE: stop the old one, then start ours (--force: no question).
+        local pid; pid="$(ocd_server_pid || true)"
+        echo ">> an OpenOCD server is already running (port 4444 answers${pid:+, pid $pid})."
+        local ans="" take=0
+        if [ "$FORCE" = 1 ]; then
+            take=1
+        elif [ -t 0 ]; then
+            read -r -p "   stop it and start a fresh server in this terminal? [Y/n] " ans || ans=""
+            case "$ans" in n|N|no|NO|No) take=0 ;; *) take=1 ;; esac
+        else
+            # no terminal to ask on (piped/scripted): keep the old, explicit refusal
+            echo "   Stop it to start a fresh one here:  pkill -x openocd   (or run:  $ME ocd --force)" >&2
+            exit 1
+        fi
+        if [ "$take" = 1 ]; then
+            if [ -n "$pid" ]; then
+                show_abs kill "$pid"; kill "$pid" 2>/dev/null || true
+            else
+                show_abs pkill -x openocd; pkill -x openocd 2>/dev/null || true
+            fi
+            local i=0
+            while ocd_server_up && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i+1)); done
+            if ocd_server_up; then
+                echo "!! port 4444 is still answering — the old server did not stop, so this one will not start a second." >&2
+                echo "   Find it: pgrep -a openocd    Stop it: pkill -x openocd" >&2
+                exit 1
+            fi
+            echo ">> old server stopped — starting a fresh one in this terminal."
+        else
+            echo ">> keeping it — use that one for build/flash/debug (these find it)."
+            echo "   To replace it here instead:  $ME ocd --force"
+            exit 0
+        fi
+    fi
+    local s=(); mapfile -t s < <(ocd_scripts_arg)
+    echo ">> OpenOCD server — leave this terminal open; build/flash/debug from another one."
+    echo "   GDB: localhost:3333   telnet: localhost:4444   Ctrl-C to stop. (the Pico must be powered)"
+    explain "OpenOCD opens the probe, connects to the RP2350 over SWD ('Examination succeed'), then waits for flash/debug requests from the other terminal"
+    start_bridge
+    trap 'stop_bridge' EXIT INT TERM
+    local st
+    while true; do
+        show "$(openocd_bin)" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET" -c "\"adapter speed $ADAPTER_SPEED\"" $OCD_QUIRK_SHOW
+        set +e
+        # No pipefail for this pipeline: when another terminal takes over (its
+        # `picolab ocd --force` kills this OpenOCD), bash under pipefail prints a stray
+        # "Done <pipeline>" job notice right where the goodbye message goes. PIPESTATUS
+        # below is unaffected by the option.
+        set +o pipefail
+        "$(openocd_bin)" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET" \
+            -c "adapter speed $ADAPTER_SPEED" "${OCD_QUIRK[@]}" 2>&1 | ocd_color server
+        st=("${PIPESTATUS[@]}")
+        set -o pipefail
+        set -e
+        # Status 3 = the probe vanished: stop, wait for it on USB, then start again.
+        if [ "${st[1]}" = 3 ]; then
+            pkill -x openocd 2>/dev/null || true
+            if ! probe_present; then
+                echo "${C_WARN}>> waiting for the probe to appear on USB — plug it in (Ctrl-C to give up)...${C_OFF}"
+                until probe_present; do sleep 1; done
+                sleep 1   # let the kernel finish enumerating it
+                echo "${C_OK}>> probe is back — restarting OpenOCD${C_OFF}"
+            else
+                sleep 2   # it's there but OpenOCD couldn't use it yet — retry shortly
+                echo ">> retrying"
+            fi
+            continue
+        fi
+        # OpenOCD's own status (PIPESTATUS[0]; st[1] is the colour filter, which exits 3
+        # for a vanished probe). 0 = a clean exit (e.g. after `program … exit`): stop.
+        # (An `if`, not `[ … ] && break`: under `set -e` a false test would exit the script.)
+        if [ "${st[0]}" = 0 ]; then break; fi
+        # Killed by a signal (>= 128): Ctrl-C here (130), or another terminal's
+        # `picolab ocd --force` taking over (143). Deliberate either way — stop; retrying
+        # would only fight the new server for port 4444.
+        if [ "${st[0]}" -ge 128 ]; then
+            echo ">> OpenOCD was stopped (killed) — this terminal's server ends here."
+            break
+        fi
+        # Anything else is almost always the *target* (not powered yet, SWD cable off,
+        # held in reset). Keep the server and the bridge up and keep trying, so the
+        # student can power the board and connect whenever they are ready.
+        echo "${C_WARN}>> OpenOCD could not reach the target — is the board powered, and are SWCLK/SWDIO/GND connected?${C_OFF}"
+        echo "   retrying in 3 s… (the bridge stays up for the course web page)"
+        sleep 3
+    done
+}
+
+flash_target() {
+    pick_elf "${1:-}" flash
+    if [ "$PROBE_FREE" = 1 ]; then        # --direct (--uf2/--picotool are aliases): straight over USB
+        flash_no_probe "$ELF"
+    else
+        program_image "$ELF"              # default, unchanged: OpenOCD over SWD
+    fi
+}
+
+# Load a prebuilt image file (ELF/HEX) directly — no build, no course target — then
+# open the serial monitor. Handy for flashing an .elf built elsewhere.
+load_image() {
+    local img="$1"
+    [ -n "$img" ] || { echo "usage: $ME load <file.elf|.uf2>"; exit 2; }
+    if [ "$PROBE_FREE" = 1 ]; then flash_no_probe "$img"; else program_image "$img"; fi
+    monitor
+}
+
+debug_target() {
+    local elf gdb
+    pick_elf "${1:-}" debug; elf="$ELF"
+    gdb="$(gdb_bin)"   # none installed: gdb_bin prints the fix and this assignment stops here
+    # Build type: ask the build's cache — but only if there IS one. A named .elf has no
+    # build/ (pick_elf points BUILD_DIR at the cache dir), and a bare `sed` on the missing
+    # file fails the assignment, so set -e exits with no message at all.
+    local btype="" cache="$BUILD_DIR/CMakeCache.txt"
+    if [ -f "$cache" ]; then btype="$(sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "$cache" 2>/dev/null || true)"; fi
+    case "$btype" in Release|MinSizeRel|"")
+        if [ -f "$cache" ]; then
+            echo "${C_ORANGE}   note: this is a ${btype:-Release (the SDK default)} build — optimised, so variables may show <optimized out>${C_OFF}"
+            echo "${C_ORANGE}         and 'n' can jump around. For a debug-friendly build: $ME debug --debug-build${C_OFF}"
+        else
+            echo "${C_ORANGE}   note: you named an existing .elf — its build type is unknown; if it is a${C_OFF}"
+            echo "${C_ORANGE}         Release build, variables may show <optimized out> and 'n' can jump around.${C_OFF}"
+        fi ;;
+    esac
+
+    # GDB launches OpenOCD itself as a "pipe" subprocess: GDB talks to it over the
+    # pipe's stdio instead of a TCP port, so there's no separate server to start or
+    # leftover process to kill — quit GDB and OpenOCD dies with it. OpenOCD's own
+    # chatter is sent to debug.openocd.log so it doesn't clutter the GDB console.
+    local s=(); mapfile -t s < <(ocd_scripts_arg)
+    local ocd_cmd="$(openocd_bin) ${s[*]} -f $OCD_IFACE -f $OCD_TARGET \
+        -c 'adapter speed $ADAPTER_SPEED' -c 'gdb port pipe; log_output $BUILD_DIR/debug.openocd.log'"
+    [ "$CMSIS_DAP_QUIRK" = 1 ] && ocd_cmd+=" -c init -c 'cmsis-dap quirk enable'"   # after gdb port: that one is config-only
+
+    # With a `picolab ocd` server running, connect to it — exactly the lab's
+    # two-terminal §5 recipe, and its terminal shows the SWD side live. Without one,
+    # the same session in one line: GDB starts OpenOCD itself over a pipe.
+    local remote
+    if ocd_server_up; then
+        remote="localhost:3333"
+        echo ">> debugging $elf via the running OpenOCD server (watch its terminal for the SWD side)"
+        explain "GDB loads the .elf into flash through the server, sets a breakpoint at main() and resets; each GDB command becomes SWD reads/writes of the chip's registers and memory"
+    else
+        remote="| $ocd_cmd"
+        echo ">> debugging $elf (the Pico must be powered)"
+        explain "GDB starts its own OpenOCD, loads the .elf into flash, sets a breakpoint at main() and resets; each GDB command becomes SWD reads/writes of the chip"
+        echo "   tip: run '$ME ocd' in a second terminal first to watch OpenOCD live."
+    fi
+    local gs="$BUILD_DIR/debug.gdb" ui=() hint="c run, n step, p var inspect, q quit."
+    case "$DEBUG_UI" in
+        tui)
+            ui=(-tui)
+            hint="the source window follows the program: n step over, s step into, c run, q quit. 'layout regs' adds registers, 'layout asm' the instructions."
+            echo "   view: GDB's own text UI (-tui) — source on top, the GDB prompt below" ;;
+        dashboard)
+            dashboard_setup; ui=(-x "$DASH_GDB")
+            hint="every stop redraws the dashboard: n step over, s step into, c run, q quit."
+            echo "   view: gdb-dashboard — $DASH_WHERE" ;;
+    esac
+    # `break main` only works if the file HAS a main symbol. A hand-written asm build (or a
+    # stripped one) doesn't, and GDB stops a command file at its first error — so that error
+    # would land before `load`'s confirmation echo and look exactly like a failed flash.
+    # Ask GDB first (symbols only, no target): if main is missing, load, halt at the entry
+    # point and explain, instead of breaking at a function that isn't there.  --no-break
+    # skips the lot on purpose: the same landing, chosen explicitly.
+    local stop_echo have_main=1
+    if [ "$NOBREAK" = 1 ]; then
+        have_main=0
+        stop_echo="\\n>> your image IS loaded and the chip is halted at its entry point (--no-break).  Set your breakpoints, then 'c' to run; 'si' steps instructions, 'info registers' shows the CPU state.\\n"
+    else
+        stop_echo="\\n>> new build loaded, stopped at main(). $hint\\n"
+        if ! "$gdb" -q -batch "$elf" -ex "info address main" >/dev/null 2>&1; then
+            have_main=0
+            stop_echo="\\n>> no 'main' symbol in this .elf (hand-written asm, or stripped build) — your image IS loaded; the chip is halted at its entry point.  'info registers' and 'x/8i \$pc' to look around, 'si' to step.\\n"
+            echo "${C_ORANGE}   note: this .elf has no 'main' symbol — GDB cannot break at main(); loading it and halting at the entry point instead${C_OFF}"
+        fi
+    fi
+    show "$gdb" -q "${ui[@]}" "$elf" -x "$gs"
+    # A TUI draws the whole screen: OpenOCD's own stderr (its banner comes before
+    # log_output takes over) would scribble over it, so in that view it goes to the log.
+    [ "$DEBUG_UI" = tui ] && [ "${remote#|}" != "$remote" ] && remote+=" 2>>$BUILD_DIR/debug.openocd.log"
+    if [ "$have_main" = 1 ]; then
+        gdb_script "$gs" "set pagination off" "target extended-remote $remote" "monitor reset halt" "load" \
+                         "monitor reset halt" "break main" "continue" \
+                         "echo $stop_echo"
+    else
+        gdb_script "$gs" "set pagination off" "target extended-remote $remote" "monitor reset halt" "load" \
+                         "monitor reset halt" \
+                         "echo $stop_echo"
+    fi
+    echo "   (if this stops with an error instead of the final '>>' line, your new"
+    echo "    build is NOT on the board — don't debug it; fix the first error and retry.)"
+    # -q quiet banner; the script loads the image, resets, and stops at main().
+    "$gdb" -q "${ui[@]}" "$elf" -x "$gs"
+}
+
+# ── debug views ─────────────────────────────────────────────────────────────────────
+# gdb-dashboard (github.com/cyrus-and/gdb-dashboard): one Python file GDB loads. After
+# every stop it redraws source, variables, stack, registers and the instructions — so a
+# student sees the machine state without typing commands, and each panel is still just
+# GDB underneath. `picolab dashboard` lends it a terminal of its own.
+PL_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/picolab"
+# Compilers put their scratch files in TMPDIR (default /tmp). On machines where /tmp is a
+# small tmpfs — or has a per-user quota, as on the course benches — a full one fails the
+# first gcc step with EDQUOT mid-build. Keep that scratch on real disk instead, unless the
+# user has chosen a TMPDIR themselves.
+if [ -z "${TMPDIR:-}" ]; then
+    mkdir -p "$PL_CACHE/tmp" 2>/dev/null || true
+    [ -d "$PL_CACHE/tmp" ] && export TMPDIR="$PL_CACHE/tmp"
+fi
+DASH_FILE="$PL_CACHE/gdb-dashboard.gdb"
+DASH_URL="https://raw.githubusercontent.com/cyrus-and/gdb-dashboard/master/.gdbinit"
+DASH_TTY_FILE="$PL_CACHE/dashboard.tty"
+DASH_WHERE=""
+
+dashboard_fetch() {
+    [ -f "$DASH_FILE" ] && return 0
+    echo ">> gdb-dashboard is not downloaded yet. It is one file, kept in $PL_CACHE:"
+    show_abs curl -fsSL "$DASH_URL" -o "$DASH_FILE"
+    local a=""; [ -t 0 ] && read -r -p "   download it now? [y/N] " a
+    case "$a" in y|Y) ;; *) echo "!! no dashboard without it — or use: $ME debug --tui" >&2; exit 1 ;; esac
+    mkdir -p "$PL_CACHE"
+    curl -fsSL "$DASH_URL" -o "$DASH_FILE.part" && mv "$DASH_FILE.part" "$DASH_FILE" \
+        || { rm -f "$DASH_FILE.part"; echo "${C_ERR}!! download failed${C_OFF}" >&2; exit 1; }
+}
+
+# Writes the GDB script that loads + configures the dashboard (path in DASH_GDB).
+dashboard_setup() {
+    dashboard_fetch >&2
+    local f="$PL_CACHE/dashboard-setup.gdb" out="" t pid
+    if [ -f "$DASH_TTY_FILE" ]; then
+        read -r t pid < "$DASH_TTY_FILE" || true
+        if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null && [ -w "$t" ]; then out="$t"; fi
+    fi
+    {
+        echo "source $DASH_FILE"
+        echo "dashboard -layout source assembly variables stack registers"
+        echo "dashboard source -style height 14"
+        echo "dashboard assembly -style height 6"
+        echo "dashboard registers -style list 'r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 r12 sp lr pc xpsr'"
+        [ -n "$out" ] && echo "dashboard -output $out"
+    } > "$f"
+    if [ -n "$out" ]; then DASH_WHERE="drawn in your 'picolab dashboard' terminal ($out)"
+    else DASH_WHERE="drawn above the prompt here (tip: '$ME dashboard' in another terminal gives it a window of its own)"; fi
+    DASH_GDB="$f"
+}
+
+# `picolab dashboard`: this terminal becomes the dashboard's window until Ctrl-C.
+dashboard_term() {
+    local t; t="$(tty)" || { echo "!! run this in a terminal" >&2; exit 1; }
+    dashboard_fetch
+    mkdir -p "$PL_CACHE"; echo "$t $$" > "$DASH_TTY_FILE"
+    echo "${C_BOLD}>> this terminal ($t) is the debug dashboard now.${C_OFF}"
+    echo "   In another terminal:  ${C_CMD}$ME debug --dashboard${C_OFF}    (Ctrl-C here to stop lending it)"
+    trap 'rm -f "$DASH_TTY_FILE"; echo; exit 0' INT TERM
+    while :; do sleep 3600; done
+}
+
+# `picolab vscode`: a click-to-debug setup for VS Code that uses the SAME toolchain —
+# Cortex-Debug attaches to your `picolab ocd` server, and the build task runs picolab.
+vscode_setup() {
+    [ -n "$PROJ" ] || { echo "!! run it inside a project folder (the one you open in VS Code)" >&2; exit 1; }
+    resolve_target ""
+    local d="$PROJ/.vscode" gdb svd a
+    gdb="$(command -v "$(gdb_bin)")"
+    svd="${PICO_SDK_PATH:-}/src/rp2350/hardware_regs/RP2350.svd"
+    [ -f "$svd" ] || svd=""
+    if [ -f "$d/launch.json" ] || [ -f "$d/tasks.json" ]; then
+        read -r -p "   $d already has launch.json / tasks.json — replace them? [y/N] " a
+        case "$a" in y|Y) ;; *) echo ">> left them as they are."; return 0 ;; esac
+    fi
+    show mkdir -p "$d"; mkdir -p "$d"
+    cat > "$d/launch.json" <<EOF
+{
+    // Written by 'picolab vscode'. Start 'picolab ocd' in a terminal first: this attaches
+    // to that OpenOCD server (port 3333), so its log still shows every SWD step.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug $TARGET (picolab ocd)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "servertype": "external",
+            "gdbTarget": "localhost:3333",
+            "gdbPath": "$gdb",
+            "cwd": "\${workspaceFolder}",
+            "executable": "\${workspaceFolder}/build/$TARGET.elf",
+            "svdFile": "$svd",
+            "preLaunchTask": "picolab build",
+            "overrideLaunchCommands": ["monitor reset halt", "load", "monitor reset halt"],
+            "overrideRestartCommands": ["monitor reset halt"],
+            "runToEntryPoint": "main"
+        }
+    ]
+}
+EOF
+    cat > "$d/tasks.json" <<EOF
+{
+    // Written by 'picolab vscode': Ctrl+Shift+B and every debug start run the same build
+    // you get in the terminal.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "picolab build",
+            "type": "shell",
+            "command": "$HERE/picolab build",
+            "options": { "cwd": "\${workspaceFolder}" },
+            "problemMatcher": ["\$gcc"],
+            "group": { "kind": "build", "isDefault": true }
+        }
+    ]
+}
+EOF
+    echo "${C_OK}>> wrote${C_OFF} .vscode/launch.json and .vscode/tasks.json"
+    explain "launch.json tells the Cortex-Debug extension which .elf, which GDB, and to attach to OpenOCD on localhost:3333; tasks.json makes its build step '$ME build'"
+    [ -n "$svd" ] || echo "${C_WARN}   (no RP2350.svd found under PICO_SDK_PATH — the peripheral register view will be empty)${C_OFF}"
+    if command -v code >/dev/null 2>&1 && ! code --list-extensions 2>/dev/null | grep -qix marus25.cortex-debug; then
+        echo ">> VS Code needs one extension for this, Cortex-Debug:"
+        show code --install-extension marus25.cortex-debug
+        read -r -p "   install it now? [y/N] " a
+        case "$a" in y|Y) code --install-extension marus25.cortex-debug ;; esac
+    fi
+    echo "   then:  terminal: $ME ocd   ·   VS Code: open $(basename "$PROJ")/, press F5"
+    echo "   ${C_DIM}(open the project folder itself in VS Code — \${workspaceFolder} must be $(basename "$PROJ"))${C_OFF}"
+}
+
+# Fallback for the Pico's own CDC: the /dev/serial/by-id symlinks are stable and
+# human-readable even when the udev PID properties are missing. Probe/probe-like entries
+# are skipped.
+find_pico_by_id() {
+    local l t
+    for l in /dev/serial/by-id/usb-Raspberry_Pi_*; do
+        [ -e "$l" ] || continue
+        case "$l" in *Debug_Probe*|*CMSIS*|*PicoGremlin*) continue ;; esac
+        t="$(readlink -f "$l")"
+        [ -n "$t" ] && { echo "$t"; return 0; }
+    done
+    return 1
+}
+
+monitor() {
+    # Programs print to BOTH the Pico USB-CDC and UART0 (GP0/1 -> Debug Probe bridge).
+    # The default prefers the probe's UART bridge (reliable for UART firmware). But
+    # USB-CDC-only firmware (pico_enable_stdio_uart 0) appears *only* on the Pico's own
+    # CDC — those labs say:  picolab monitor usb
+    #   picolab monitor usb     -> the Pico's own USB-CDC
+    #   picolab monitor probe   -> the probe UART bridge (the default)
+    #   picolab monitor /dev/ttyACMx   (or SERIAL=/dev/ttyACMx) -> exactly that port
+    local dev="${1:-${SERIAL:-}}" kind="" prefer=""
+    case "$dev" in
+        usb|pico|cdc)     dev=""; prefer="usb" ;;
+        probe|uart|bridge) dev=""; prefer="probe" ;;
+    esac
+    if [ -z "$dev" ]; then
+        if [ "$prefer" = usb ]; then
+            # A just-flashed board reboots; USB-CDC re-enumerates a second or two later, so
+            # give it a moment before declaring the port missing.
+            local i=0
+            while [ "$i" -lt 10 ]; do
+                dev="$(find_acm_by_pid '0009|000a' pico || true)"
+                [ -n "$dev" ] && break
+                [ "$i" -eq 2 ] && echo ">> waiting for the Pico's USB-CDC to appear..."
+                i=$((i + 1)); sleep 0.5
+            done
+            [ -n "$dev" ] || dev="$(find_pico_by_id || true)"
+            kind="the Pico's own USB-CDC"
+        else
+            dev="$(find_acm_by_pid 000c        || true)"; kind="Debug Probe UART bridge"
+            [ -n "$dev" ] || { dev="$(find_acm_by_pid 0009 probe || true)"; kind="probe UART bridge (CMSIS-DAP firmware on PID 0009)"; }
+            [ -n "$dev" ] || { dev="$(find_acm_by_pid '0009|000a' pico || true)"; kind="the Pico's own USB-CDC"; }
+        fi
+    else kind="you asked for it"; fi
+    if [ -z "$dev" ]; then
+        if [ "$prefer" = usb ]; then
+            echo "!! no Pico USB-CDC serial port found."
+            echo "   'monitor usb' reads the Pico's OWN USB cable — not the probe, and not the"
+            echo "   UART pins. Check, in order:"
+            echo "     - the Pico's own USB cable is plugged into the PC (BOOTSEL + probe USB is not enough);"
+            echo "     - the board is running YOUR firmware, not sitting in BOOTSEL (in BOOTSEL it is a disk);"
+            echo "     - the firmware enables USB stdio:  pico_enable_stdio_usb(<target> 1)"
+            echo "     - and STARTS it at run time:      stdio_init_all();   (the build flag alone is"
+            echo "                                      not enough — a program with an empty main never opens the port)"
+            echo "     - the OS sees a port:  ls /dev/ttyACM*   (then: $ME monitor /dev/ttyACM0)"
+        else
+            echo "!! no Pico/probe serial port found (probe plugged in? UART wired to GP0/GP1?)"
+            echo "   no probe? read the Pico's own USB-CDC instead:  $ME monitor usb"
+        fi
+        exit 1
+    fi
+    echo ">> serial monitor on $dev — $kind"
+    # Silence here is a wiring answer, not a firmware one: the UART bridge only carries
+    # bytes if the probe's U cable is on GP0/GP1, and the Pico's USB-CDC only exists if
+    # the Pico's own USB is plugged into the PC. Say so rather than staring at a blank pane.
+    explain "the program's printf goes out of UART0 (GP0/GP1) to the probe bridge and/or the Pico's own USB-CDC; this reads the port named above ('picolab monitor usb' for USB-CDC-only firmware)"
+    echo "   (no output? the program needs pico_enable_stdio_uart(<name> 1); with a separate"
+    echo "    Debug Probe, also wire GP0->probe RX / GP1->probe TX / GND;"
+    echo "    USB-CDC needs the Pico's own USB cable in the PC. Ctrl-C to quit.)"
+    show "$HERE/serial-term.sh $dev 115200     # = stty -F $dev 115200 raw -echo; cat $dev   (or: picocom -b 115200 $dev)"
+    exec "$HERE/serial-term.sh" "$dev" 115200
+}
+
+# ── logic analyzer ──────────────────────────────────────────────────────────────
+# The PicoGremlin's second function (CDC interface if03). The tools are their own project
+# (picogremlin-la, GPL-3.0, own installer); picolab runs them — on the same probe it
+# resolved for flashing/debug — and shows the command like every other step.
+la_cmd() {
+    local b ser d
+    if ! b="$(la_bin)"; then
+        echo "!! the logic-analyzer tools ('la') are not installed." >&2
+        echo "   Install the CLI + Qt GUI:  $ME doctor --fix    (with a PicoGremlin attached)" >&2
+        echo "   ...or directly:  curl -fsSL https://raw.githubusercontent.com/gsebik/picogremlin-la/main/install.sh | bash" >&2
+        exit 1
+    fi
+    # Same board as OpenOCD/monitor: PICOGREMLIN_SERIAL is the RP2350 OTP chip id, which the
+    # la tools use to pick this probe's if03 port on a multi-probe bench.
+    if [ -z "${PICOGREMLIN_SERIAL:-}" ]; then
+        for d in /sys/bus/usb/devices/*; do
+            [ "$(cat "$d/idVendor" 2>/dev/null)" = 2e8a ] || continue
+            grep -qiE 'logicanalyzer' "$d/product" 2>/dev/null || continue
+            ser="$(cat "$d/serial" 2>/dev/null)"; [ -n "$ser" ] && { export PICOGREMLIN_SERIAL="$ser"; break; }
+        done
+    fi
+    show "$b" "$@"
+    exec "$b" "$@"
+}
+
+# ── versions ────────────────────────────────────────────────────────────────────
+# SDK to clone when there is none. setup.md pins 2.2.0 for the lab image; override with
+# PICOLAB_SDK_VERSION to move every student to another release at once.
+SDK_VERSION="${PICOLAB_SDK_VERSION:-2.3.0}"
+# picotool to build when the SDK cannot tell us the version it wants (no SDK yet). Must be a
+# real picotool release tag; override with PICOLAB_PICOTOOL_VERSION.
+PICOTOOL_VERSION="${PICOLAB_PICOTOOL_VERSION:-2.3.0}"
+
+# <have> satisfies <want>: same major, and have >= want (CMake's SameMajorVersion rule,
+# which is how the SDK checks picotool).
+ver_ok() { [ "${1%%.*}" = "${2%%.*}" ] && [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+# The picotool version this SDK demands (tools/CMakeLists.txt).
+sdk_picotool_want() {
+    grep -m1 -oE 'picotool_VERSION_REQUIRED[ \t]+[0-9]+\.[0-9]+\.[0-9]+' \
+        "${PICO_SDK_PATH:-/nonexistent}/tools/CMakeLists.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
+}
+# Every picotool CMake package a BUILD could consider, in CMake's search order: picotool_DIR,
+# then a prefix for every PATH entry (<x>/bin -> <x>) in PATH order, then /usr/local, /usr.
+# The SDK asks find_package(picotool <version>): CMake SKIPS candidates too old and takes
+# the first compatible one; configure only dies ("Incompatible picotool installation")
+# when every candidate is too old. So an old copy early on PATH is harmless to builds.
+picotool_cfgs() {
+    local p pre c IFS=:
+    if [ -n "${picotool_DIR:-}" ] && [ -f "$picotool_DIR/picotoolConfigVersion.cmake" ]; then
+        echo "$picotool_DIR/picotoolConfigVersion.cmake"
+    fi
+    for p in $PATH /usr/local/bin /usr/bin; do
+        case "$p" in */bin|*/sbin) pre="${p%/*}" ;; *) pre="$p" ;; esac
+        for c in "$pre/lib/cmake/picotool" "$pre/lib64/cmake/picotool" "$pre/share/picotool/cmake"; do
+            [ -f "$c/picotoolConfigVersion.cmake" ] && echo "$c/picotoolConfigVersion.cmake"
+        done
+        # Debian/Ubuntu multiarch path, e.g. /usr/lib/x86_64-linux-gnu/cmake/picotool
+        for c in /usr/lib/*/cmake/picotool /usr/local/lib/*/cmake/picotool; do
+            [ -f "$c/picotoolConfigVersion.cmake" ] && echo "$c/picotoolConfigVersion.cmake"
+        done
+    done | awk '!seen[$0]++'   # PATH may repeat a prefix
+}
+# The one a build will use for <want>: the first compatible candidate (empty if none).
+build_picotool_cfg() {
+    local c; while read -r c; do ver_ok "$(cfg_version "$c")" "$1" && { echo "$c"; return 0; }; done < <(picotool_cfgs)
+    return 1
+}
+cfg_version() { grep -m1 -oE 'PACKAGE_VERSION "[0-9]+\.[0-9]+\.[0-9]+' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'; }
+
+# ── doctor --fix: show the exact commands, ask, and only then run them ──────────────
+confirm() {
+    [ "${YES:-0}" = 1 ] && return 0          # --yes: run every fix without asking
+    if [ ! -t 0 ]; then echo "   (no terminal to ask on — not running anything; copy the commands above)"; return 1; fi
+    local a; read -r -p "   run these now? [y/N] " a
+    case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+propose() {   # propose <what it fixes> <command>...   — runs them in order, stops at the first failure
+    local title="$1" c; shift
+    echo; echo "${C_CMD}>> fix: $title${C_OFF}"
+    for c in "$@"; do show_abs "$c"; done
+    confirm || { echo "   skipped."; return 1; }
+    for c in "$@"; do
+        echo; show_abs "$c"
+        bash -c "$c" || { echo "${C_ERR}!! this step failed — nothing after it was run: $c${C_OFF}" >&2; return 1; }
+    done
+    echo "${C_OK}>> done: $title${C_OFF}"
+}
+# Distro package names for the tools doctor checks (Arch / Debian-Ubuntu).
+pkg_install_cmd() {   # pkg_install_cmd <tool>...  — echoes one install command, or nothing
+    local t pkgs=()
+    if command -v pacman >/dev/null 2>&1; then
+        for t in "$@"; do case "$t" in
+            gcc) pkgs+=(arm-none-eabi-gcc arm-none-eabi-newlib arm-none-eabi-binutils) ;;
+            gdb) pkgs+=(arm-none-eabi-gdb) ;; *) pkgs+=("$t") ;; esac; done
+        echo "sudo pacman -S --needed ${pkgs[*]}"
+    elif command -v apt-get >/dev/null 2>&1; then
+        for t in "$@"; do case "$t" in
+            gcc) pkgs+=(gcc-arm-none-eabi libnewlib-arm-none-eabi) ;; gdb) pkgs+=(gdb-multiarch) ;;
+            ninja) pkgs+=(ninja-build) ;; *) pkgs+=("$t") ;; esac; done
+        echo "sudo apt-get install -y ${pkgs[*]}"
+    fi
+}
+
+fix_packages() {
+    local cmd; cmd="$(pkg_install_cmd "${DR_MISSING_PKGS[@]}")"
+    [ -n "$cmd" ] || { echo; echo ">> install these with your package manager: ${DR_MISSING_PKGS[*]} (setup §1)"; return 1; }
+    propose "install missing system tools: ${DR_MISSING_PKGS[*]}" "$cmd"
+}
+fix_sdk_clone() {
+    local dest="$HOME/pico-sdk" d best="" bestv="" v
+    # Prefer the course-pinned version if it is on disk; otherwise the NEWEST SDK found.
+    # (Never silently pick an older SDK over one the user just installed.)
+    for d in "$HOME/pico-sdk" "$HOME"/pico-sdk-* "$HOME"/.pico-sdk/sdk/*; do
+        [ -f "$d/pico_sdk_init.cmake" ] || continue
+        v="$(git -C "$d" describe --tags 2>/dev/null | sed 's/^v//')"; [ -n "$v" ] || v="?"
+        if [ "$v" = "$SDK_VERSION" ]; then best="$d"; bestv="$v"; break; fi
+        if [ -z "$bestv" ] || [ "$(printf '%s\n%s\n' "$bestv" "$v" | sort -V | tail -1)" = "$v" ]; then
+            best="$d"; bestv="$v"
+        fi
+    done
+    if [ -n "$best" ]; then
+        echo; echo "${C_CMD}>> fix: use the Pico SDK $bestv at $best (course pin: $SDK_VERSION)${C_OFF}"
+        echo "   $PICOLAB_ENV  <-  export PICO_SDK_PATH=\"$best\""
+        confirm || { echo "   skipped."; return 1; }
+        env_write PICO_SDK_PATH "$best"; rc_source_env
+        echo "${C_OK}>> done: PICO_SDK_PATH=$best — active for picolab now, and in new shells${C_OFF}"
+        return 0
+    fi
+    [ -e "$dest" ] && dest="$HOME/pico-sdk-$SDK_VERSION"
+    if propose "get the Pico SDK $SDK_VERSION with its submodules, and set PICO_SDK_PATH" \
+        "git -c advice.detachedHead=false clone --depth 1 --branch $SDK_VERSION https://github.com/raspberrypi/pico-sdk.git '$dest'" \
+        "git -C '$dest' submodule update --init --recursive --depth 1"; then
+        env_write PICO_SDK_PATH "$dest"; rc_source_env
+        echo "   active for picolab now, and in new shells via $PICOLAB_ENV"
+    fi
+}
+fix_sdk_submodules() {
+    propose "fetch the SDK's missing submodules (TinyUSB, lwIP, mbedTLS, pioasm, ...)" \
+        "git -C '$PICO_SDK_PATH' submodule update --init --recursive"
+}
+fix_picotool_build() {
+    # Newer toolchains can fail to compile picotool's bundled mbedTLS (GCC 15 warnings, and
+    # mbedTLS API drift against older picotool). Prefer the prebuilt distro package.
+    #
+    # libusb is what gives picotool device access. Without the headers CMake silently
+    # produces a no-USB binary ("compiled without USB support") that cannot flash — so
+    # install the dependency before configuring.
+    if command -v apt-get >/dev/null 2>&1; then
+        propose "install the picotool build dependency (libusb headers)" \
+            "sudo apt-get install -y libusb-1.0-0-dev" || true
+    elif command -v pacman >/dev/null 2>&1; then
+        propose "install the picotool build dependency (libusb headers)" \
+            "sudo pacman -S --needed libusb" || true
+    fi
+    if fix_picotool_pkg; then return 0; fi
+    if [ -z "${PICO_SDK_PATH:-}" ] || [ ! -f "$PICO_SDK_PATH/pico_sdk_init.cmake" ]; then
+        echo "!! picotool's build needs a valid PICO_SDK_PATH — set it first with '$ME doctor --fix' (SDK fix), then retry" >&2
+        return 1
+    fi
+    local want src; want="$(sdk_picotool_want)"; [ -n "$want" ] || want="$PICOTOOL_VERSION"
+    src="$HOME/.cache/picolab/picotool-$want"
+    # picotool's CMake REQUIRES PICO_SDK_PATH, and that pulls in the SDK's mbedTLS — so the
+    # SDK submodules must be initialized first, or configure dies in lib/mbedtls
+    # ("framework/CMakeLists.txt not found"). The doctor's SDK-submodule check flags this
+    # too, but make the picotool fix self-sufficient.
+    # -Wno-error: GCC 15 turns newer warnings (e.g. mbedTLS's unterminated-string-init)
+    # into errors. If the source build still fails on mbedTLS API drift, use the distro
+    # package instead:  fix_picotool_pkg.
+    # -DCMAKE_POLICY_VERSION_MINIMUM=3.5: CMake 4 dropped compatibility with
+    # cmake_minimum_required(VERSION < 3.5), and the mbedTLS bundled with older SDKs
+    # (2.1.x pins mbedTLS 2.28, i.e. VERSION 2.8.12) still declares less — configure then
+    # dies in pico-sdk/lib/mbedtls with "Compatibility with CMake < 3.5 has been removed".
+    # The flag restores exactly that compatibility; newer SDKs/CMake simply ignore it.
+    if propose "build picotool $want — the version this SDK asks for — from git into ~/.local (no sudo)" \
+        "git -C '$PICO_SDK_PATH' submodule update --init --recursive" \
+        "rm -rf '$src' && git -c advice.detachedHead=false clone --depth 1 --branch $want https://github.com/raspberrypi/picotool.git '$src'" \
+        "cmake -S '$src' -B '$src/build' ${GEN_ARGS[*]} -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX='$HOME/.local' -DPICO_SDK_PATH='$PICO_SDK_PATH' -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_C_FLAGS=-Wno-error -DCMAKE_CXX_FLAGS=-Wno-error" \
+        "cmake --build '$src/build' -j$(nproc)" \
+        "cmake --install '$src/build'"; then
+        if [ -x "$HOME/.local/bin/picotool" ] && ! picotool_has_usb "$HOME/.local/bin/picotool"; then
+            echo "!! the built picotool has NO USB support — libusb headers were not found at configure time." >&2
+            echo "   Install libusb-1.0-0-dev (or your distro's equivalent), remove $src, and retry." >&2
+            return 1
+        fi
+        local hint=""
+        if command -v pacman >/dev/null 2>&1; then hint="yay -S picotool (AUR)"
+        else hint="$(pkg_install_cmd picotool)"; fi
+        if [ -n "$hint" ]; then
+            echo "   if this fails on mbedTLS/API errors, install the prebuilt instead:  $hint"
+        fi
+    fi
+}
+fix_picotool_shadow() {
+    # Remove every too-old install as a unit — binary, CMake package, data files — so
+    # the shell's `picotool` and the builds' one are the same program again.
+    local e pre v owner paths=() f sudo=""
+    for e in "${DR_PT_OLD[@]}"; do
+        pre="${e%|*}"; v="${e#*|}"
+        owner="$({ pacman -Qoq "$pre/lib/cmake/picotool/picotoolConfig.cmake" || dpkg -S "$pre/lib/cmake/picotool" | cut -d: -f1; } 2>/dev/null | head -1 || true)"
+        if [ -n "$owner" ]; then
+            echo; echo ">> the old picotool v$v in $pre belongs to the package '$owner' — remove or update it"
+            echo "   with your package manager (not done automatically)."; continue
+        fi
+        for f in "$pre/bin/picotool" "$pre/lib/cmake/picotool" "$pre/lib64/cmake/picotool" "$pre/share/picotool"; do
+            [ -e "$f" ] && paths+=("'$f'")
+        done
+        [ -w "$pre" ] || sudo="sudo "
+    done
+    [ "${#paths[@]}" -gt 0 ] || return 1
+    local list; list="$(printf '%s, ' "${DR_PT_OLD[@]//|/ v}")"; list="${list%, }"
+    propose "remove the old picotool install(s) ($list) — builds already skip them; this makes the shell's picotool the $DR_PT_BUILD_V one" \
+        "${sudo}rm -rf ${paths[*]}"
+}
+
+# Locate a *usable* picotool binary for the shell path that `picolab flash --direct` uses:
+# USB-enabled, so a build without libusb (no 'load' command) is skipped, not returned.
+# Prefers one already on PATH.
+find_picotool_cli() {
+    local d
+    if [ -n "${DR_PT_CLI:-}" ] && [ -x "$DR_PT_CLI" ] && picotool_has_usb "$DR_PT_CLI"; then echo "$DR_PT_CLI"; return 0; fi
+    d="$(command -v picotool 2>/dev/null || true)"; [ -n "$d" ] && picotool_has_usb "$d" && { echo "$d"; return 0; }
+    local c pre
+    while read -r c; do
+        pre="${c%%/lib/cmake/*}"; pre="${pre%%/lib64/cmake/*}"; pre="${pre%%/share/picotool/*}"
+        [ -x "$pre/bin/picotool" ] && picotool_has_usb "$pre/bin/picotool" && { echo "$pre/bin/picotool"; return 0; }
+    done < <(picotool_cfgs)
+    d=$(ls "$HOME"/.pico-sdk/picotool/*/picotool 2>/dev/null | head -1 || true)
+    [ -n "$d" ] && picotool_has_usb "$d" && { echo "$d"; return 0; }
+    d=$(ls "$HOME"/.local/bin/picotool 2>/dev/null | head -1 || true)
+    [ -n "$d" ] && picotool_has_usb "$d" && { echo "$d"; return 0; }
+    return 1
+}
+# Prefer the distro's prebuilt picotool. It avoids the mbedTLS/GCC-15 source-build pain
+# entirely, and the package usually ships the CMake config the SDK's build looks for.
+# Only propose a package the distro really has: Arch keeps picotool in the AUR (pacman
+# cannot see it) and not every Debian/Ubuntu release has it — a failed "target not found"
+# sudo step helps nobody, and the source build below does it without sudo anyway.
+fix_picotool_pkg() {
+    local cmd="" in_repos="" out=""
+    if command -v apt-get >/dev/null 2>&1; then
+        cmd="sudo apt-get install -y picotool"
+        apt-cache show picotool >/dev/null 2>&1 && in_repos=1
+    elif command -v pacman >/dev/null 2>&1; then
+        cmd="sudo pacman -S --needed picotool"
+        pacman -Si picotool >/dev/null 2>&1 && in_repos=1
+    elif command -v zypper >/dev/null 2>&1; then
+        cmd="sudo zypper install -y picotool"
+        out="$(LC_ALL=C zypper --non-interactive search --match-exact picotool 2>/dev/null || true)"
+        case "$out" in *picotool*) in_repos=1 ;; esac
+    fi
+    [ -n "$cmd" ] || return 1
+    if [ -z "$in_repos" ]; then
+        if command -v pacman >/dev/null 2>&1; then
+            echo; echo ">> picotool is not in Arch's official repositories (the AUR has it: yay -S picotool)"
+        else
+            echo; echo ">> picotool is not in this distro's package repositories"
+        fi
+        echo ">> building it from source instead (no sudo, into ~/.local)"
+        return 1
+    fi
+    propose "install the prebuilt picotool from your distro (no compile, no mbedTLS)" "$cmd"
+}
+
+# Make the shell's `picotool` work: link an existing binary into ~/.local/bin, or build one
+# if none is on the machine. This is what `picolab flash --direct` / `picolab load --direct` run.
+fix_picotool_cli() {
+    local pcli dir link rc
+    dir="$HOME/.local/bin"; link="$dir/picotool"   # not in the `local` line: $dir is not yet set there
+    pcli="$(find_picotool_cli || true)"            # skips no-USB builds
+    if [ -z "$pcli" ]; then
+        # No USB-enabled binary: install the prebuilt package, else rebuild from source
+        # (both paths ensure libusb is present first).
+        if ! fix_picotool_pkg; then fix_picotool_build; fi
+        pcli="$(find_picotool_cli || true)"
+        if [ -z "$pcli" ]; then
+            echo "!! picotool is still not usable — probe-free flashing needs a USB-enabled build." >&2
+            return 1
+        fi
+    fi
+    case "${SHELL##*/}" in zsh) rc="$HOME/.zshrc" ;; *) rc="$HOME/.bashrc" ;; esac
+    if [ -e "$link" ] && [ "$(readlink -f "$pcli")" = "$(readlink -f "$link")" ]; then
+        echo ">> picotool already at $link — nothing to do."
+        return 0
+    fi
+    if [ -e "$link" ]; then
+        # Something unusable sits at $link (typically a no-USB build that shadows the good
+        # binary on PATH): replace it, so `picotool` becomes the USB-enabled one.
+        propose "replace the unusable picotool at $link with $pcli (USB-enabled)" \
+            "ln -sfn '$pcli' '$link'"
+    else
+        propose "make picotool runnable from the shell (link $pcli -> $link) for probe-free flashing" \
+            "mkdir -p '$dir'" \
+            "ln -sfn '$pcli' '$link'"
+    fi
+    case ":$PATH:" in
+        *":$dir:"*) ;;
+        *) echo "   note: $dir is not on PATH — add once:  echo 'export PATH=\"$dir:\$PATH\"' >> $rc" ;;
+    esac
+}
+
+# The 2e8a rule. uaccess alone is granted at the udev "add" event to the ACTIVE local
+# session — a probe already plugged in at boot gets that event before login, so the ACL is
+# never applied and the device stays root-only until a manual trigger (why a machine needed
+# the fix again after every reboot). A group fallback (plugdev for USB, dialout/uucp for
+# tty) survives reboots; it is emitted only when the system has that group, so Arch stays
+# uaccess-only for USB (no plugdev there).
+udev_rule_text() {
+    local usb="" tty="" g
+    getent group plugdev >/dev/null 2>&1 && usb="plugdev"
+    for g in dialout uucp; do getent group "$g" >/dev/null 2>&1 && { tty="$g"; break; }; done
+    echo '# Raspberry Pi (Pico, RP2350 bootrom, PicoGremlin/Debug Probe) — grant the active local user access.'
+    echo '# uaccess covers a local desktop session; the group fallback keeps working after a reboot'
+    echo '# (the add event at boot fires before login, so the ACL is not applied then).'
+    if [ -n "$usb" ]; then
+        echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"2e8a\", TAG+=\"uaccess\", MODE=\"0660\", GROUP=\"$usb\""
+    else
+        echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"2e8a\", TAG+=\"uaccess\""
+    fi
+    if [ -n "$tty" ]; then
+        echo "SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"2e8a\", TAG+=\"uaccess\", MODE=\"0660\", GROUP=\"$tty\""
+    else
+        echo "SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"2e8a\", TAG+=\"uaccess\""
+    fi
+}
+# The groups the generated rule assigns (for the "log out and back in" hint).
+udev_rule_groups() {
+    local g
+    getent group plugdev >/dev/null 2>&1 && echo plugdev
+    for g in dialout uucp; do getent group "$g" >/dev/null 2>&1 && { echo "$g"; break; }; done
+}
+# Why a 2e8a device node is not accessible, in words a student can act on.
+perm_reason() {
+    local rule=/etc/udev/rules.d/99-pico.rules g miss=""
+    if [ ! -f "$rule" ]; then echo "no 2e8a udev rule yet (setup §4)"; return; fi
+    for g in $(udev_rule_groups); do
+        case " $(id -nG) " in *" $g "*) ;; *) miss+="$g " ;; esac
+    done
+    if [ -n "$miss" ]; then
+        echo "the rule is installed, but you are not in ${miss% } yet — log out and back in"
+    else
+        echo "the rule is installed; this session has no access — uaccess covers a local login, so log in locally (or replug the probe)"
+    fi
+}
+
+fix_udev() {
+    local src="$PL_CACHE/99-pico.rules" rule=/etc/udev/rules.d/99-pico.rules miss="" g
+    mkdir -p "$PL_CACHE"
+    udev_rule_text > "$src"
+    propose "install the udev rule for Raspberry Pi USB devices (no sudo for flash, OpenOCD, serial)" \
+        "sudo install -m644 '$src' '$rule'" \
+        "sudo udevadm control --reload-rules" \
+        "sudo udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=2e8a" \
+        "sudo udevadm trigger --action=add --subsystem-match=tty"
+    for g in $(udev_rule_groups); do
+        case " $(id -nG) " in *" $g "*) ;; *) miss+="$g " ;; esac
+    done
+    if [ -n "$miss" ]; then
+        propose "add $(id -un) to the device group(s) ${miss% } — the group fallback needs it after a reboot" \
+            "sudo usermod -aG $(printf '%s' "${miss% }" | tr ' ' ',') $(id -un)"
+        echo "   log out and back in for the group to apply (uaccess covers this session)."
+    fi
+    echo "   applied to already-connected devices too — a replug is not required."
+}
+
+# The logic-analyzer tools (la CLI + Qt GUI) from picogremlin-la's own installer: a sibling
+# checkout if present (dev benches — the same rule pg uses), else the published installer.
+# Kept a separate project on purpose: GPL-3.0, its own consumers and release cycle.
+fix_la() {
+    local sh="${PICOGREMLIN_LA_SRC:-$REPO/../picogremlin-la}/install.sh"
+    if [ -x "$sh" ]; then
+        propose "install the PicoGremlin logic-analyzer tools (la CLI + Qt GUI) from $sh" "bash '$sh'"
+    else
+        propose "install the PicoGremlin logic-analyzer tools (la CLI + Qt GUI) — picogremlin-la's installer" \
+            "curl -fsSL https://raw.githubusercontent.com/gsebik/picogremlin-la/main/install.sh | bash"
+    fi
+    echo "   then:  $ME la info   ·   $ME la gui"
+}
+
+# Build the Raspberry Pi OpenOCD fork — it is the one that carries target/rp2350.cfg —
+# into ~/.pico-sdk/openocd/pi-fork, where openocd_bin()/ocd_scripts_arg() already look.
+# Needs autotools + libusb dev headers; installed first if missing.
+fix_openocd() {
+    local src="$HOME/.cache/picolab/openocd" dst="$HOME/.pico-sdk/openocd/pi-fork" deps="" conf_extra=""
+    if command -v apt-get >/dev/null 2>&1; then
+        deps="sudo apt-get install -y git build-essential libtool automake autoconf pkg-config libusb-1.0-0-dev libhidapi-dev libjim-dev texinfo"
+    elif command -v pacman >/dev/null 2>&1; then
+        deps="sudo pacman -S --needed git base-devel libtool automake autoconf pkgconf libusb hidapi jimtcl texinfo"
+    fi
+    [ -n "$deps" ] && propose "install the OpenOCD build dependencies (autotools, libusb, hidapi, jimtcl)" "$deps"
+    # jimtcl is required. Use the system one if present; otherwise build the bundled copy
+    # (--enable-internal-jimtcl, deprecated but works — needs the jimtcl submodule).
+    if ! pkg-config --exists jimtcl 2>/dev/null && [ ! -f /usr/include/jim.h ]; then
+        conf_extra="--enable-internal-jimtcl"
+    fi
+    if propose "build the Raspberry Pi OpenOCD fork (has target/rp2350.cfg) into $dst" \
+        "rm -rf '$src' && git clone --depth 1 https://github.com/raspberrypi/openocd.git '$src'" \
+        "cd '$src' && git submodule update --init jimtcl" \
+        "cd '$src' && ./bootstrap" \
+        "cd '$src' && ./configure --prefix='$dst' --enable-cmsis-dap --disable-werror $conf_extra" \
+        "make -C '$src' -j$(nproc)" \
+        "make -C '$src' install"; then
+        echo "   installed: $dst/bin/openocd  (picolab finds it automatically)"
+    fi
+}
+
+fix_freertos() {
+    propose "fetch the FreeRTOS kernel submodule (for the RTOS labs)" \
+        "git -C '$DR_FR_ROOT' submodule update --init lib/FreeRTOS-Kernel"
+}
+# No course repo / no kernel submodule: clone the Raspberry Pi FreeRTOS-Kernel fork (it ships
+# the RP2350 port in-tree) and record FREERTOS_KERNEL_PATH in picolab's env file.
+fix_freertos_global() {
+    local dest; dest="$(freertos_install_dir)"
+    if propose "get FreeRTOS $FREERTOS_PINNED (RP2350 port) and set FREERTOS_KERNEL_PATH" \
+        "[ -f '$dest/tasks.c' ] || { mkdir -p '$(dirname "$dest")' && git clone --depth 1 --branch $FREERTOS_PINNED https://github.com/FreeRTOS/FreeRTOS-Kernel.git '$dest' && git -C '$dest' submodule update --init --depth 1 portable/ThirdParty/Community-Supported-Ports; }"; then
+        env_write FREERTOS_KERNEL_PATH "$dest"; rc_source_env
+        echo "   active for picolab now, and in new shells"
+    fi
+}
+# The kernel is present and has its port, but at the wrong revision. Replace it
+# rather than trying to move a shallow or forked checkout onto the pinned tag.
+fix_freertos_pin() {
+    local dest; dest="$(freertos_install_dir)"
+    if propose "install FreeRTOS $FREERTOS_PINNED beside the current checkout and point FREERTOS_KERNEL_PATH at it" \
+        "rm -rf '$dest'" \
+        "mkdir -p '$(dirname "$dest")' && git clone --depth 1 --branch $FREERTOS_PINNED https://github.com/FreeRTOS/FreeRTOS-Kernel.git '$dest'" \
+        "git -C '$dest' submodule update --init --depth 1 portable/ThirdParty/Community-Supported-Ports"; then
+        env_write FREERTOS_KERNEL_PATH "$dest"; rc_source_env
+        echo "   active for picolab now, and in new shells"
+    fi
+}
+fix_freertos_port() {
+    propose "fetch the kernel's RP2350 port (a nested submodule)" \
+        "git -C '$DR_FR_KERNEL' submodule update --init portable/ThirdParty/Community-Supported-Ports"
+}
+
+# doctor — walk every step the lab tutorials rely on and report ok/FAIL/note, each
+# with the setup section that fixes it. Ends with a real compile of the smallest
+# target, so a clean run proves configure→compile→link actually works.
+# `doctor --fix` then offers the fixes it knows, one at a time, asking before each.
+doctor() {
+    local mode="${1:-}" ok=0 bad=0 warn=0 note=0
+    FIXES=(); DR_MISSING_PKGS=(); DR_BOARD=""; DR_OCD_OK=0; DR_FR_OK=0
+    # ok   (green)  : works
+    # FAIL (red)    : a lab step WILL fail until this is fixed
+    # warn (orange) : fine for building / the simulator, but the board steps
+    #                 (flash, debug, monitor) won't work right now — usually "plug it in"
+    # note (dim)    : for information; nothing to do unless you need that feature
+    mark() {  # mark <ok|FAIL|warn|note> <label> <detail...>
+        local s="$1" label="$2" c=""; shift 2
+        case "$s" in
+            ok)   ok=$((ok+1));     c="$C_OK" ;;
+            FAIL) bad=$((bad+1));   c="$C_ERR" ;;
+            warn) warn=$((warn+1)); c="$C_ORANGE" ;;
+            note) note=$((note+1)); c="$C_DIM" ;;
+        esac
+        printf '  %s[%-4s] %-18s%s %s\n' "$c" "$s" "$label" "$C_OFF" "$*"
+    }
+    echo "${C_BOLD}== picolab doctor — the toolchain every lab step uses ==${C_OFF}"
+
+    if command -v arm-none-eabi-gcc >/dev/null 2>&1; then
+        mark ok  "cross gcc" "arm-none-eabi-gcc $(arm-none-eabi-gcc -dumpversion 2>/dev/null)"
+    else mark FAIL "cross gcc" "missing — install the ARM cross toolchain (setup §1)"; DR_MISSING_PKGS+=(gcc); fi
+
+    if command -v cmake >/dev/null 2>&1; then mark ok "cmake" "$(cmake --version | head -1 | awk '{print $3}')"
+    else mark FAIL "cmake" "missing (setup §1)"; DR_MISSING_PKGS+=(cmake); fi
+
+    if command -v ninja >/dev/null 2>&1; then mark ok "ninja" "$(ninja --version)"
+    elif command -v make >/dev/null 2>&1; then mark note "ninja" "absent — will fall back to make (setup §1)"; DR_MISSING_PKGS+=(ninja)
+    else mark FAIL "ninja/make" "no build tool found (setup §1)"; DR_MISSING_PKGS+=(ninja); fi
+
+    if command -v git >/dev/null 2>&1; then mark ok "git" "$(git --version | awk '{print $3}')"
+    else mark FAIL "git" "missing (setup §1)"; DR_MISSING_PKGS+=(git); fi
+
+    # Pico SDK + the two submodules that bite (setup §2 danger box)
+    if [ -z "${PICO_SDK_PATH:-}" ]; then
+        mark FAIL "PICO_SDK_PATH" "not set — export it (setup §2, or: $ME help env)"; FIXES+=(sdk_clone)
+    elif [ ! -f "$PICO_SDK_PATH/pico_sdk_init.cmake" ]; then
+        mark FAIL "PICO_SDK_PATH" "not an SDK: $PICO_SDK_PATH (setup §2)"; FIXES+=(sdk_clone)
+    else
+        mark ok "PICO_SDK_PATH" "$PICO_SDK_PATH ($(git -C "$PICO_SDK_PATH" describe --tags 2>/dev/null || echo '?'))"
+        local miss=""
+        [ -f "$PICO_SDK_PATH/tools/pioasm/CMakeLists.txt" ] || miss="pioasm"
+        [ -n "$(ls -A "$PICO_SDK_PATH/lib/tinyusb" 2>/dev/null)" ] || miss="${miss:+$miss, }tinyusb"
+        [ -n "$(ls -A "$PICO_SDK_PATH/lib/lwip" 2>/dev/null)" ] || miss="${miss:+$miss, }lwip"
+        [ -n "$(ls -A "$PICO_SDK_PATH/lib/mbedtls" 2>/dev/null)" ] || miss="${miss:+$miss, }mbedtls"
+        if [ -z "$miss" ]; then mark ok "SDK submodules" "pioasm + tinyusb present"
+        else mark FAIL "SDK submodules" "missing: $miss — git -C \"\$PICO_SDK_PATH\" submodule update --init (setup §2)"; FIXES+=(sdk_submodules); fi
+    fi
+
+    # OpenOCD is only needed with a debug probe. With a plain Pico, the probe-free picotool
+    # path is the one that matters, so a missing OpenOCD is a note, not a problem.
+    local hp=0; probe_present && hp=1
+    local ocd=""
+    command -v openocd >/dev/null 2>&1 && ocd=openocd \
+        || ocd="$(ls "$HOME"/.pico-sdk/openocd/*/openocd "$HOME"/.pico-sdk/openocd/*/bin/openocd 2>/dev/null | head -1 || true)"
+    if [ -n "$ocd" ]; then
+        local ver cfg="" sdir
+        ver="$("$ocd" --version 2>&1 | grep -oE '0\.[0-9][0-9.]*[^ ]*' | head -1)"
+        for sdir in "${OPENOCD_SCRIPTS:-}" "$(dirname "$ocd")/scripts" "$(dirname "$ocd")/../share/openocd/scripts" \
+                    /usr/local/share/openocd/scripts /usr/share/openocd/scripts; do
+            [ -n "$sdir" ] && [ -f "$sdir/target/rp2350.cfg" ] && { cfg="$sdir"; break; }
+        done
+        if [ -n "$cfg" ]; then DR_OCD_OK=1; mark ok "openocd" "$ver (rp2350.cfg found)"
+        elif [ "$hp" = 1 ]; then mark FAIL "openocd" "$ver but no target/rp2350.cfg — need the Pi fork / OPENOCD_SCRIPTS (setup §3)"; FIXES+=(openocd)
+        else mark note "openocd" "$ver but no target/rp2350.cfg — only needed with a probe"; fi
+    elif [ "$hp" = 1 ]; then
+        mark FAIL "openocd" "not found — a probe is connected, so SWD needs it (setup §3)"; FIXES+=(openocd)
+    else
+        mark note "openocd" "not installed — not needed without a probe (probe-free uses picotool); '$ME doctor --fix' can build it if you add one"
+    fi
+
+    # Ask the same gdb_bin the debug/flash pipelines launch, so "doctor is green" can never
+    # again disagree with what 'picolab debug' actually runs (Debian/Ubuntu: gdb-multiarch).
+    local gdbbin=""
+    if gdbbin="$(gdb_bin 2>/dev/null)"; then
+        mark ok "gdb" "$(basename "$gdbbin") $("$gdbbin" --version 2>/dev/null | head -1 | grep -oE '[0-9][0-9.]+' | head -1)"
+    else mark FAIL "gdb" "missing — arm-none-eabi-gdb / gdb-multiarch (setup §1)"; DR_MISSING_PKGS+=(gdb); fi
+
+    # picotool is not merely "nice to have": since SDK 2.x the build calls it to make the
+    # .uf2 and the boot_stage2 disassembly, and it must be at least the version the SDK asks
+    # for (same major, >= that version — CMake's own rule). An OLDER one installed system-wide
+    # is worse than none at all: the SDK finds it, refuses it, and configure dies with
+    # "Incompatible picotool installation found" long before any of your code is compiled.
+    # Two different picotools can be in play, and they are checked separately:
+    #   - the one BUILDS use: the CMake package the SDK's find_package() finds;
+    #   - the one your SHELL runs when you type `picotool` (first on PATH).
+    # A stale shell one doesn't break builds, but `picotool load/info` would be the old tool.
+    # With a debug probe attached, picotool is deliberately note-only: SWD is the flashing
+    # path there, it is only needed for the probe-free case — and a stray one is exactly the
+    # tool that (asked wrongly) can flash the debugger itself.
+    local pt_offer=1; [ "$hp" = 1 ] && pt_offer=0
+    local want cfg="" c v
+    want="$(sdk_picotool_want)"
+    DR_PT_BUILD_V=""; DR_PT_CLI=""; DR_PT_CLI_V=""; DR_PT_OLD=()
+    DR_PT_CLI="$(command -v picotool 2>/dev/null || true)"
+    # `|| true`: a picotool whose `version` prints no x.y.z (e.g. a broken build) must not
+    # kill doctor under pipefail — an empty version is handled below.
+    [ -n "$DR_PT_CLI" ] && DR_PT_CLI_V="$("$DR_PT_CLI" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+    if [ -z "$want" ]; then
+        mark note "picotool" "SDK requirement unreadable (no SDK, or no tools/CMakeLists.txt) — checked after the SDK is fixed"
+    else
+        # Old installs (too old for this SDK): builds skip them, but they're clutter at best
+        # and the shell's `picotool` at worst. Remember their prefixes for the fix.
+        while read -r c; do
+            v="$(cfg_version "$c")"; ver_ok "$v" "$want" || DR_PT_OLD+=("${c%/*/*/*/*}|$v")
+        done < <(picotool_cfgs)
+        cfg="$(build_picotool_cfg "$want" || true)"
+        if [ -n "$cfg" ]; then
+            DR_PT_BUILD_V="$(cfg_version "$cfg")"
+            mark ok "picotool" "builds use $DR_PT_BUILD_V from ${cfg%/*/*/*/*} (SDK wants >= $want)"
+            if [ -n "$DR_PT_CLI_V" ] && ! ver_ok "$DR_PT_CLI_V" "$want"; then
+                mark note "picotool (shell)" "typing 'picotool' runs $DR_PT_CLI v$DR_PT_CLI_V — an older install that comes first on your PATH (builds skip it)"
+                FIXES+=(picotool_shadow)
+            fi
+        elif [ "${#DR_PT_OLD[@]}" -gt 0 ]; then
+            mark FAIL "picotool" "only too-old installs found (${DR_PT_OLD[*]//|/ v}) but this SDK wants $want — configure dies with \"Incompatible picotool installation\" (setup §5)"
+            FIXES+=(picotool_build)
+        elif [ -n "${PICOTOOL_FETCH_FROM_GIT_PATH:-}" ]; then
+            mark ok "picotool" "none installed — the SDK builds its own, cached in $PICOTOOL_FETCH_FROM_GIT_PATH"
+        elif [ "$pt_offer" = 1 ]; then
+            mark note "picotool" "none installed for builds — the SDK downloads and builds one inside every lab's build/ (slow first builds; setup §5)"
+            FIXES+=(picotool_build)
+        else
+            mark note "picotool" "none installed — every build makes its own (slower first build); a debug probe is connected, so flashing needs none (setup §5)"
+        fi
+    fi
+
+    # The binary the SHELL runs is what `picolab flash --direct` (probe-free flashing) needs.
+    # The build check above can be green while this is missing — a build-only install, or the
+    # binary not on PATH — so check it separately and offer to link or build one.
+    if [ -n "$DR_PT_CLI" ]; then
+        if picotool_has_usb "$DR_PT_CLI"; then
+            mark ok "picotool (USB flash)" "$DR_PT_CLI v${DR_PT_CLI_V:-?} — for 'picolab flash --direct'"
+        elif [ "$pt_offer" = 1 ]; then
+            mark FAIL "picotool (USB flash)" "$DR_PT_CLI v${DR_PT_CLI_V:-?} was compiled WITHOUT USB support (no 'load' command) — run doctor --fix to rebuild it with libusb, or flash by dragging the .uf2 (setup §5)"
+            FIXES+=(picotool_cli)
+        else
+            mark note "picotool (USB flash)" "$DR_PT_CLI v${DR_PT_CLI_V:-?} was compiled WITHOUT USB support — harmless while a probe flashes over SWD; rebuild or remove it before probe-free use (setup §5)"
+        fi
+    else
+        local pcli; pcli="$(find_picotool_cli || true)"
+        if [ "$pt_offer" = 0 ]; then
+            if [ -n "$pcli" ]; then
+                mark note "picotool (USB flash)" "$pcli found — not linked; only probe-free flashing needs it (setup §5)"
+            else
+                mark note "picotool (USB flash)" "not installed — only probe-free flashing needs it; the probe flashes over SWD (setup §5)"
+            fi
+        elif [ -n "$pcli" ]; then
+            mark note "picotool (USB flash)" "$pcli found but 'picotool' is not on PATH — link it for --direct (setup §5)"
+            FIXES+=(picotool_cli)
+        else
+            mark note "picotool (USB flash)" "not installed — 'picolab flash --direct' (for a board with no debug probe) needs it (setup §5)"
+            FIXES+=(picotool_cli)
+        fi
+    fi
+
+    # PicoGremlin's logic analyzer: the `la` CLI (+ Qt GUI) is a separate project and only
+    # useful with that probe, so a missing install is a note — and --fix only offers it
+    # when the hardware is actually here.
+    local la=""; la="$(la_bin || true)"
+    if [ -n "$la" ]; then
+        local lav; lav="$("$la" --version 2>/dev/null | head -1 || true)"
+        mark ok "logic analyzer" "${lav:-la}  ($la)"
+    elif probe_has_la; then
+        mark note "logic analyzer" "PicoGremlin LA tools not installed — '$ME doctor --fix' installs the la CLI + Qt GUI"
+        FIXES+=(la)
+    else
+        mark note "logic analyzer" "la tools not installed — only needed with a PicoGremlin (its logic analyzer)"
+    fi
+
+    local frk=""
+    if frk="$(freertos_kernel_dir)"; then
+        if freertos_port_import >/dev/null; then
+            local fver; fver="$(freertos_kernel_version || true)"
+            if [ "$fver" = "$FREERTOS_PINNED" ]; then
+                DR_FR_OK=1; mark ok "FreeRTOS kernel" "$frk ($fver, RP2350_ARM_NTZ port found)"
+            else
+                mark FAIL "FreeRTOS kernel" "$frk reports ${fver:-an unreadable version}; this course requires $FREERTOS_PINNED. A build from it prints kernel=${fver:-?} instead of kernel=$FREERTOS_PINNED and is not comparable with the released images (setup §7). Set FREERTOS_KERNEL_VERSION only if the lab really pins another revision."
+                DR_FR_KERNEL="$frk"; DR_FR_OK=0; FIXES+=(freertos_pin)
+            fi
+        else
+            mark FAIL "FreeRTOS kernel" "$frk has no RP2350 port — it is a nested submodule: git -C \"$frk\" submodule update --init portable/ThirdParty/Community-Supported-Ports (setup §7)"
+            DR_FR_KERNEL="$frk"; FIXES+=(freertos_port)
+        fi
+    else
+        mark note "FreeRTOS kernel" "not set up — needed for the RTOS labs (setup §7)"
+        local r found=0
+        for r in "${LAB_ROOTS[@]}"; do
+            if grep -q 'lib/FreeRTOS-Kernel' "$r/.gitmodules" 2>/dev/null; then DR_FR_ROOT="$r"; FIXES+=(freertos); found=1; break; fi
+        done
+        [ "$found" = 1 ] || FIXES+=(freertos_global)
+    fi
+
+    # The real thing: create a brand-new project exactly as `picolab init` does, then
+    # configure + build it end to end — the same path a student's first project takes,
+    # independent of any course's lab folders.
+    if [ -n "${PICO_SDK_PATH:-}" ] && [ -f "$PICO_SDK_PATH/pico_sdk_init.cmake" ]; then
+        # Build on real disk, not /tmp: /tmp is a small RAM-backed tmpfs on many machines
+        # (this course's own benches included), and a full one fails the build mid-way with
+        # EDQUOT — the log redirect itself cannot even be written, so doctor shows an empty
+        # log and a FAIL that names nothing.
+        mkdir -p "$PL_CACHE"
+        local td; td="$(mktemp -d "$PL_CACHE/doctor.XXXXXX")"
+        if (init_project "$td/doctor_blink" </dev/null) >"$td/log" 2>&1 \
+           && cmake -S "$td/doctor_blink" -B "$td/doctor_blink/build" "${GEN_ARGS[@]}" >>"$td/log" 2>&1 \
+           && cmake --build "$td/doctor_blink/build" >>"$td/log" 2>&1 && [ -f "$td/doctor_blink/build/doctor_blink.uf2" ]; then
+            mark ok "compile pipeline" "a fresh 'picolab init' project built to .uf2 (configure→compile→link OK)"
+            rm -rf "$td"
+        else mark FAIL "compile pipeline" "a fresh 'picolab init' project failed to build — log kept at $td/log"; fi
+    else mark note "compile pipeline" "skipped (fix PICO_SDK_PATH first)"; fi
+
+    doctor_hardware
+
+    # --all: provision everything, probe or not — OpenOCD and the logic-analyzer tools
+    # (normally notes without a probe) and the FreeRTOS kernel (normally a note until the
+    # RTOS labs).
+    if [ "$ALL" = 1 ]; then
+        if [ "${DR_OCD_OK:-0}" != 1 ]; then
+            case " ${FIXES[*]-} " in *" openocd "*) ;; *) FIXES+=(openocd) ;; esac
+        fi
+        if [ "${DR_FR_OK:-0}" != 1 ]; then
+            case " ${FIXES[*]-} " in
+                *" freertos "*) ;; *" freertos_global "*) ;; *" freertos_port "*) ;;
+                *) FIXES+=(freertos_global) ;;
+            esac
+        fi
+        # The udev rule (setup §4): harmless to install ahead of the board, and it saves the
+        # 'root-only USB node' round-trip on a fresh machine.
+        if [ ! -f /etc/udev/rules.d/99-pico.rules ]; then
+            case " ${FIXES[*]-} " in *" udev "*) ;; *) FIXES+=(udev) ;; esac
+        fi
+        # The PicoGremlin's logic-analyzer tools are normally only *offered* when that probe
+        # is attached; --all provisions them anyway, so a lab image is complete even when it
+        # was built with nothing plugged in.
+        if ! la_bin >/dev/null 2>&1; then
+            case " ${FIXES[*]-} " in *" la "*) ;; *) FIXES+=(la) ;; esac
+        fi
+    fi
+
+    echo
+    local sum="${C_OK}$ok ok${C_OFF}"
+    [ "$bad"  -gt 0 ] && sum+=", ${C_ERR}$bad problem(s)${C_OFF}"
+    [ "$warn" -gt 0 ] && sum+=", ${C_ORANGE}$warn warning(s)${C_OFF}"
+    [ "$note" -gt 0 ] && sum+=", $note note(s)"
+    echo "Summary: $sum."
+    if [ "${#FIXES[@]}" -gt 0 ] || [ "${#DR_MISSING_PKGS[@]}" -gt 0 ]; then
+        [ "${#DR_MISSING_PKGS[@]}" -gt 0 ] && FIXES=(packages "${FIXES[@]}")
+        if [ "$mode" = "--fix" ]; then
+            local f; for f in "${FIXES[@]}"; do "fix_$f" || true; done
+            echo; echo ">> re-run '$ME doctor' to check the result."
+            return 0
+        fi
+        echo "${C_CMD}$ME doctor --fix${C_OFF} can fix ${#FIXES[@]} of these: it shows the exact commands for each and asks before running them."
+    fi
+    if [ "$bad" -eq 0 ] && [ "$warn" -eq 0 ]; then
+        case "$DR_BOARD" in
+            pico-bootsel|pico-usb)
+                echo "${C_OK}Environment looks good${C_OFF}; plain Pico ready for probe-free: $ME flash --direct <lab>  ·  $ME monitor usb" ;;
+            *)
+                echo "${C_OK}Environment and board look good${C_OFF} — next: $ME l0_blink   (build → flash → monitor)." ;;
+        esac
+    elif [ "$bad" -eq 0 ]; then
+        echo "${C_OK}Toolchain looks good${C_OFF}; ${C_ORANGE}the board isn't ready${C_OFF} — see the [warn] lines. Building and the simulator work now."
+    else
+        echo "${C_ERR}Fix the [FAIL] items above${C_OFF} — each names its setup section. See: $ME help"; return 1
+    fi
+}
+
+# The board half of doctor: probe on USB → allowed to open it → its serial bridge →
+# the RP2350 actually answering over SWD. Each step says what the next one needs, so
+# "debugger not connected" and "connected but the target is dead" look different.
+doctor_hardware() {
+    echo
+    echo "${C_BOLD}== board: PicoGremlin / debug probe and the Pico ==${C_OFF}"
+    local d="" dev=""
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = 2e8a ] || continue
+        case "$(cat "$d/idProduct" 2>/dev/null)" in 000c|0009) ;; *) continue ;; esac
+        # PID 0009 is also a plain Pico's console — only count it if it's a probe.
+        grep -qiE 'cmsis|debug.probe' "$d/product" 2>/dev/null || [ "$(cat "$d/idProduct")" = 000c ] || continue
+        dev="$d"; break
+    done
+    if [ -z "$dev" ]; then
+        # No probe. A plain Pico is still fully usable via the probe-free path; detect it
+        # (BOOTSEL or running USB stdio) and say which commands apply.
+        local pdev="" ppid="" pprod=""
+        for d in /sys/bus/usb/devices/*; do
+            [ "$(cat "$d/idVendor" 2>/dev/null)" = 2e8a ] || continue
+            case "$(cat "$d/idProduct" 2>/dev/null)" in
+                0003|000f) pdev="$d" ;;   # RP2040 / RP2350 BOOTSEL
+                0009|000a) grep -qiE 'cmsis|debug.probe' "$d/product" 2>/dev/null || pdev="$d" ;;  # RP2350 / RP2040 CDC
+            esac
+            [ -n "$pdev" ] && { ppid="$(cat "$d/idProduct")"; pprod="$(cat "$d/product" 2>/dev/null)"; break; }
+        done
+        local chip=""
+        case "$ppid" in
+            0003|000a) chip="RP2040 (Pico 1 / Pico W)" ;;
+            000f|0009) chip="RP2350 (Pico 2 / 2 W)" ;;
+        esac
+        case "$ppid" in
+            0003|000f) DR_BOARD=pico-bootsel
+                       mark ok "Pico (BOOTSEL)" "$chip in bootloader mode (2e8a:$ppid)"
+                       mark note "debug probe" "not connected — SWD needs it; probe-free works now: '$ME flash --direct <lab>'" ;;
+            0009|000a) DR_BOARD=pico-usb
+                       mark ok "Pico (USB)" "$chip running USB stdio ($pprod)"
+                       mark note "debug probe" "not connected — SWD needs it; probe-free works now: '$ME flash --direct <lab>', '$ME monitor usb'" ;;
+            *)         DR_BOARD=none
+                       mark warn "debug probe" "NOT CONNECTED — SWD flash/debug needs the PicoGremlin/Debug Probe"
+                       mark note "Pico" "no RP-series device on USB — connect the Pico's own USB (for --direct) or the probe (for SWD)" ;;
+        esac
+        # picotool opens the raw USB device; without a udev rule only root may.
+        if [ -n "$pdev" ]; then
+            local node; node="$(printf '/dev/bus/usb/%03d/%03d' "$(cat "$pdev/busnum")" "$(cat "$pdev/devnum")")"
+            if [ -r "$node" ] && [ -w "$node" ]; then
+                mark ok "Pico permission" "$node is accessible to $(id -un) — picotool can flash"
+            else
+                mark FAIL "Pico permission" "$node is root-only — $(perm_reason); '$ME doctor --fix' updates the rule and groups"
+                FIXES+=(udev)
+            fi
+        fi
+        if find_acm_by_pid 0009 pico >/dev/null; then
+            mark note "Pico console" "$(find_acm_by_pid 0009 pico) — console over the Pico's own USB"
+        fi
+        return 0
+    fi
+    DR_BOARD=probe
+    local prod; prod="$(cat "$dev/product" 2>/dev/null || echo "?")"
+    mark ok "debug probe" "$prod (2e8a:$(cat "$dev/idProduct"), USB $(basename "$dev"))"
+
+    # OpenOCD opens the raw USB device; without a udev rule only root may.
+    local node; node="$(printf '/dev/bus/usb/%03d/%03d' "$(cat "$dev/busnum")" "$(cat "$dev/devnum")")"
+    local perm_bad=0
+    if [ -r "$node" ] && [ -w "$node" ]; then
+        mark ok "probe permission" "$node is accessible to $(id -un)"
+    else
+        mark FAIL "probe permission" "$node is root-only — $(perm_reason); '$ME doctor --fix' updates the rule and groups"
+        FIXES+=(udev); perm_bad=1
+    fi
+
+    local tty
+    if tty="$(find_acm_by_pid 000c || find_acm_by_pid 0009 probe)"; then
+        if [ -r "$tty" ] && [ -w "$tty" ]; then mark ok "serial bridge" "$tty (what '$ME monitor' opens)"
+        else mark FAIL "serial bridge" "$tty exists but you can't open it — add yourself to its group ($(stat -c %G "$tty")) and log in again"; fi
+    else
+        mark warn "serial bridge" "the probe has no serial port — '$ME monitor' won't show UART output (probe firmware?)"
+    fi
+
+    # Permission first: without it OpenOCD only reports "no matching CMSIS-DAP device",
+    # which reads as a cable problem and sends people hunting for the wrong thing — the
+    # FAIL above is the real one, and its fix (the udev rule) is already queued.
+    if [ "$perm_bad" = 1 ]; then
+        mark note "target (SWD)" "skipped — OpenOCD cannot open the probe until the udev rule above is installed"
+        return 0
+    fi
+
+    # The real test: does the RP2350 answer over SWD? Skipped when a `picolab ocd`
+    # server already owns the probe (a second OpenOCD can't open it).
+    if ocd_server_up; then
+        mark ok "target (SWD)" "a '$ME ocd' server owns the probe — check its terminal for 'Examination succeed'"
+        return 0
+    fi
+    local ocd; ocd="$(openocd_bin 2>/dev/null)" || { mark note "target (SWD)" "skipped (no openocd)"; return 0; }
+    local s=(); mapfile -t s < <(ocd_scripts_arg)
+    local init=(-c init); [ "$CMSIS_DAP_QUIRK" = 1 ] && init=("${OCD_QUIRK[@]}")
+    local log; log="$(timeout 15 "$ocd" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET"         -c "adapter speed $ADAPTER_SPEED" "${init[@]}" -c shutdown 2>&1 || true)"
+    if echo "$log" | grep -q "Examination succeed"; then
+        mark ok "target (SWD)" "RP2350 answers over SWD at $ADAPTER_SPEED kHz"
+    elif echo "$log" | grep -qiE "permission|LIBUSB_ERROR_ACCESS"; then
+        mark FAIL "target (SWD)" "OpenOCD may not open the probe (USB permission) — see 'probe permission'"
+    elif echo "$log" | grep -qiE "unable to find a matching CMSIS-DAP|No such device"; then
+        mark FAIL "target (SWD)" "OpenOCD can't find the probe it just saw on USB — replug it (loose cable, or it reset)"
+    else
+        mark FAIL "target (SWD)" "probe OK but the RP2350 does not answer — is the Pico powered and seated on the PicoGremlin? Try ADAPTER_SPEED=1000"
+        echo "$log" | grep -m3 '^Error' | sed "s/^/           ${C_DIM}/; s/\$/${C_OFF}/"
+    fi
+}
+
+# init — create a new Pico project folder, doing exactly what L0 §2 does by hand, one
+# numbered step at a time, printing each command and why. `--step` pauses before every
+# step (for a first lab); the files it writes are shown in full, with every line explained.
+init_project() {
+    local dir="" step=0 blink=0 a
+    for a in "$@"; do
+        case "$a" in
+            --step) step=1 ;;
+            --blink) blink=1 ;;
+            -*) echo "!! unknown option '$a' — usage: $ME init <folder> [--step] [--blink]" >&2; exit 2 ;;
+            *) dir="$a" ;;
+        esac
+    done
+    [ -n "$dir" ] || { echo "usage: $ME init <folder> [--step]   e.g. $ME init my-blink" >&2; exit 2; }
+    if [ -e "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+        echo "!! '$dir' already exists and is not empty — pick a new folder name (nothing was changed)." >&2; exit 1
+    fi
+    require_sdk
+    local name target board n=5 i=0
+    name="$(basename "$dir")"
+    target="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_' '_')"      # CMake target: letters, digits, _
+    case "$target" in [0-9]*) target="p_$target" ;; esac
+    board="${PICO_BOARD:-pico2_w}"
+
+    stepn() {   # stepn <title> <why...>  — number the step, explain it, optionally wait
+        local title="$1" l; shift; i=$((i+1))
+        echo; echo "${C_CMD}[$i/$n] $title${C_OFF}"
+        for l in "$@"; do echo "      $l"; done
+        if [ "$step" = 1 ] && [ -t 0 ]; then read -r -p "      press Enter to run it (Ctrl-C to stop) " _; fi
+    }
+    showfile() { sed "s/^/      ${C_CMD}|${C_OFF} /" "$1"; }
+
+    echo ">> new Pico project '$name' (board $board, SDK $(git -C "$PICO_SDK_PATH" describe --tags 2>/dev/null || echo "at $PICO_SDK_PATH"))"
+
+    stepn "make the project folder" \
+          "One folder = one program. Everything it needs lives here; the build goes in build/."
+    show mkdir -p "$dir"; mkdir -p "$dir"
+
+    stepn "copy the SDK's CMake helper into it" \
+          "pico_sdk_import.cmake is how YOUR project finds the Pico SDK: it reads \$PICO_SDK_PATH." \
+          "Copied, not linked, so the project also builds on a machine with a different SDK path."
+    show cp "$PICO_SDK_PATH/external/pico_sdk_import.cmake" "$dir/"
+    cp "$PICO_SDK_PATH/external/pico_sdk_import.cmake" "$dir/"
+
+    stepn "write CMakeLists.txt — the whole build description" \
+          "Which board, which SDK libraries, which source files, and where printf goes."
+    sed -e "s/@NAME@/$name/g" -e "s/@TARGET@/$target/g" -e "s/@BOARD@/$board/g" > "$dir/CMakeLists.txt" <<'EOF'
+# @NAME@ — created by `picolab init`. Plain CMake: nothing here is hidden or generated later.
+cmake_minimum_required(VERSION 3.13)
+
+# Must come BEFORE the SDK import: picks the board (the Pico 2 W is an RP2350).
+set(PICO_BOARD @BOARD@ CACHE STRING "Board type")
+
+# Finds the Pico SDK through $PICO_SDK_PATH (the file copied in step 2).
+include(pico_sdk_import.cmake)
+
+project(@TARGET@ C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # build/compile_commands.json: every exact gcc command line
+
+pico_sdk_init()                         # sets up the SDK's libraries and the cross-compiler
+
+add_executable(@TARGET@ main.c)
+target_link_libraries(@TARGET@ pico_stdlib)   # GPIO, timers, stdio (printf)
+
+# printf goes to BOTH USB-CDC and UART0 (GP0/GP1). UART0 reaches the PC through the
+# Debug Probe's UART bridge — what `picolab monitor` reads first, and what the
+# simulator's console shows.
+pico_enable_stdio_usb(@TARGET@ 1)
+pico_enable_stdio_uart(@TARGET@ 1)
+
+pico_add_extra_outputs(@TARGET@)        # also make .uf2 (drag-and-drop), .dis (disassembly), .map
+EOF
+    show "cat > $dir/CMakeLists.txt  <<'EOF'   (the file:)"; showfile "$dir/CMakeLists.txt"
+
+    if [ "$blink" = 1 ]; then
+        stepn "write main.c — a blink that narrates itself" \
+              "GP16/GP17 are the EP-0172 carrier's user LEDs. (The Pico 2 W's own LED is wired" \
+              "to the wireless chip, not a GPIO — gpio_put(25, …) silently does nothing.)"
+        sed -e "s/@NAME@/$name/g" > "$dir/main.c" <<'EOF'
+// @NAME@ — blink the EP-0172 user LEDs (GP16, GP17) in opposite phase and narrate every
+// step on serial. Created by `picolab init --blink` — now make it yours.
+#include <stdio.h>
+#include "pico/stdlib.h"
+
+#define LED1_PIN 16   // EP-0172 user LED 1
+#define LED2_PIN 17   // EP-0172 user LED 2
+
+int main(void) {
+    stdio_init_all();   // printf -> USB-CDC and UART0, as CMakeLists.txt asks
+
+    gpio_init(LED1_PIN);
+    gpio_set_dir(LED1_PIN, GPIO_OUT);
+    gpio_init(LED2_PIN);
+    gpio_set_dir(LED2_PIN, GPIO_OUT);
+
+    printf("@NAME@: blinking GP%d / GP%d\n", LED1_PIN, LED2_PIN);
+
+    bool on = false;
+    for (uint32_t tick = 0;; tick++) {
+        on = !on;
+        gpio_put(LED1_PIN, on);
+        gpio_put(LED2_PIN, !on);   // opposite phase: easy to see both work
+        printf("tick %lu: LED1=%d LED2=%d\n", (unsigned long)tick, on, !on);
+        sleep_ms(250);
+    }
+}
+EOF
+    else
+        stepn "write main.c — an empty main() to build on" \
+              "Nothing runs yet: the folder, the SDK finder and the build description are in" \
+              "place, and the program is yours to write. (Want the EP-0172 blink demo?" \
+              "Use: $ME init <folder> --blink)"
+        sed -e "s/@NAME@/$name/g" > "$dir/main.c" <<'EOF'
+// @NAME@ — created by `picolab init`.
+// The project builds; main() is empty on purpose. Your program goes here — no demo
+// to delete first. (For the EP-0172 blink demo: `picolab init <folder> --blink`.)
+#include "pico/stdlib.h"
+
+int main(void) {
+    /* your program goes here */
+    for (;;) {
+        tight_loop_contents();   /* portable "do nothing" — the CPU idles here */
+    }
+}
+EOF
+    fi
+    show "cat > $dir/main.c  <<'EOF'   (the file:)"; showfile "$dir/main.c"
+
+    stepn "write .gitignore" \
+          "build/ is regenerated from these files at any time — never commit it."
+    printf 'build/\n' > "$dir/.gitignore"
+    show "echo 'build/' > $dir/.gitignore"
+
+    echo
+    echo "${C_OK}>> '$name' is ready.${C_OFF} Next:"
+    echo "     cd $dir"
+    echo "     $ME build          # configure + compile (prints the exact cmake commands)"
+    echo "     $ME flash --direct    # upload straight over USB — no debug probe needed"
+    echo "     $ME flash          # ...or over SWD with the Debug Probe"
+    echo "     $ME debug          # ...and stop in main() under GDB (probe only)"
+    echo "   or paste main.c into the simulator to try it with no board at all."
+}
+
+# install — make `picolab` a normal command. A symlink, not a copy, so it always runs
+# THIS checkout: a `git pull` of the course repo updates the command too.
+rc_file() { case "${SHELL##*/}" in zsh) echo "$HOME/.zshrc" ;; *) echo "$HOME/.bashrc" ;; esac; }
+
+# Write/update one variable in picolab's env file (created if needed). picolab sources this at
+# startup, so a change is active on the very next command — no shell restart.
+env_write() {
+    local key="$1" val="$2" dir
+    dir="$(dirname "$PICOLAB_ENV")"; mkdir -p "$dir"
+    [ -f "$PICOLAB_ENV" ] || : > "$PICOLAB_ENV"
+    if grep -q "^export $key=" "$PICOLAB_ENV" 2>/dev/null; then
+        sed -i.bak "s#^export $key=.*#export $key=\"$val\"#" "$PICOLAB_ENV" && rm -f "$PICOLAB_ENV.bak"
+    else
+        echo "export $key=\"$val\"" >> "$PICOLAB_ENV"
+    fi
+    # Also set it for THIS process, so later fixes in the same `doctor --fix` run use it
+    # (the env file is only sourced at startup).
+    printf -v "$key" '%s' "$val"
+    export "$key"
+}
+
+# Make interactive shells source picolab's env file (once), so PICO_SDK_PATH etc. are set
+# without hand-editing the rc.
+rc_source_env() {
+    local rc; rc="$(rc_file)"
+    grep -q 'picolab/env' "$rc" 2>/dev/null && return 0
+    printf '\n# picolab environment (SDK path etc.)\n[ -f "%s" ] && . "%s"\n' "$PICOLAB_ENV" "$PICOLAB_ENV" >> "$rc"
+}
+
+# Optional upgrade: install a newer Pico SDK than the course pin (and optionally refresh
+# picotool/OpenOCD for it). The default install stays pinned, so the course stays in sync.
+upgrade_cmd() {
+    local ver="${1:-}"
+    if [ -z "$ver" ]; then
+        ver="$(git ls-remote --tags https://github.com/raspberrypi/pico-sdk.git 'refs/tags/*' 2>/dev/null \
+              | sed 's#.*refs/tags/##' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+        [ -n "$ver" ] || { echo "!! could not find the latest SDK tag (network?) — pass one: $ME upgrade 2.2.0" >&2; exit 1; }
+        echo ">> latest stable Pico SDK: $ver   (the course pins ${SDK_VERSION}; this is opt-in)"
+    fi
+    local dest="$HOME/.pico-sdk/sdk/$ver"
+    if propose "install Pico SDK $ver and point PICO_SDK_PATH at it (optional upgrade)" \
+        "[ -f '$dest/pico_sdk_init.cmake' ] || { mkdir -p '$HOME/.pico-sdk/sdk' && git -c advice.detachedHead=false clone --depth 1 --branch '$ver' https://github.com/raspberrypi/pico-sdk.git '$dest'; }" \
+        "git -C '$dest' submodule update --init --recursive --depth 1"; then
+        env_write PICO_SDK_PATH "$dest"; rc_source_env
+        echo "   active for picolab NOW (via $PICOLAB_ENV), and in new shells."
+        echo "   switch back to the course pin:  picolab upgrade $SDK_VERSION"
+    fi
+    if [ "$INSTALL_TOOLS" = 1 ]; then
+        echo; echo ">> --tools: refreshing picotool/OpenOCD for this SDK ..."
+        doctor --fix
+    fi
+}
+
+# Put a directory on PATH for future shells. Idempotent: a marker comment guards against
+# appending twice, and the generated line itself avoids duplicate entries. Called by
+# `install`; a child process cannot change the current shell, so it says how to pick the
+# change up now.
+rc_path_add() {
+    local dir="$1" rc; rc="$(rc_file)"
+    if grep -q '# picolab PATH' "$rc" 2>/dev/null; then
+        case ":$PATH:" in
+            *":$dir:"*) echo ">> done — from any folder:  picolab help" ;;
+            *) echo ">> $dir is already in $rc (the 'picolab PATH' line) — open a new terminal, or:  source $rc" ;;
+        esac
+        return 0
+    fi
+    {
+        printf '\n# picolab PATH\n'
+        printf 'case ":$PATH:" in *":%s:"*) ;; *) PATH="%s:$PATH" ;; esac\n' "$dir" "$dir"
+        printf 'export PATH\n'
+    } >> "$rc"
+    case ":$PATH:" in
+        *":$dir:"*) echo ">> done — from any folder:  picolab help" ;;
+        *) echo ">> added $dir to PATH in $rc — open a new terminal, or:  source $rc" ;;
+    esac
+}
+
+install_cli() {
+    local dir="${1:-$HOME/.local/bin}" link
+    link="$dir/picolab"
+    if [ -L "$link" ] || [ -e "$link" ]; then
+        if [ "$(readlink -f "$link")" != "$HERE/picolab" ]; then
+            echo "!! $link already exists and points elsewhere ($(readlink -f "$link"))." >&2
+            echo "   Remove it first if it's an old copy:  rm \"$link\"" >&2
+            exit 1
+        fi
+    fi
+    echo ">> installing picolab as a link to $HERE/picolab"
+    show_abs mkdir -p "$dir";                 mkdir -p "$dir"
+    show_abs ln -sfn "$HERE/picolab" "$link"; ln -sfn "$HERE/picolab" "$link"
+    rc_path_add "$dir"
+    rc_source_env   # new shells pick up PICO_SDK_PATH etc. from picolab's env file
+    [ -n "${PICO_SDK_PATH:-}" ] || echo ">> no SDK set yet — '$ME install --tools' finds or clones one and records it in $PICOLAB_ENV"
+    if [ "$INSTALL_BRIDGE" = 1 ]; then
+        echo
+        echo ">> --bridge: building picosim-bridge (the browser ↔ OpenOCD relay)…"
+        local src="${PICOSIM_SRC:-$HOME/Work/src/pico-sim}"
+        if [ -f "$src/native-core/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+            ( cd "$src/native-core" && cargo build --release -p bridge ) \
+                && show_abs install -Dm755 "$src/native-core/target/release/picosim-bridge" "$dir/picosim-bridge" \
+                && install -Dm755 "$src/native-core/target/release/picosim-bridge" "$dir/picosim-bridge" \
+                && echo ">> installed $dir/picosim-bridge"
+        else
+            echo "!! no pico-sim checkout found (looked in $src)."
+            echo "   Clone github.com/OE-KVK-H2IoT/pico-sim and set PICOSIM_SRC=/path/to/pico-sim, then rerun."
+        fi
+    fi
+    echo ">> then check the whole toolchain:  picolab doctor"
+    if [ "$INSTALL_TOOLS" = 1 ]; then
+        echo
+        echo ">> --tools: checking the toolchain now, and offering each fix (picotool included)…"
+        doctor --fix
+    else
+        echo "   one shot — link picolab AND set up the whole toolchain (picotool included):"
+        echo "     $ME install --tools --all --yes"
+    fi
+}
+
+uninstall_cli() {
+    local link="${1:-$HOME/.local/bin}/picolab"
+    if [ -L "$link" ] && [ "$(readlink -f "$link")" = "$HERE/picolab" ]; then
+        show_abs rm "$link"; rm "$link"; echo ">> removed — the course repo itself is untouched"
+    else
+        echo "!! no picolab link of ours at $link — nothing to remove" >&2; exit 1
+    fi
+}
+
+cmd="${1:-}"; shift || true
+NOBUILD=0; VERBOSE=0; ELF=""; DEBUG_UI=""; PROBE_FREE=0; INSTALL_TOOLS=0; INSTALL_BRIDGE=0; YES=0; ALL=0
+FORCE=0    # `picolab ocd --force`: replace an OpenOCD server that is already running
+NOBREAK=0  # `picolab debug --no-break`: load and halt at the entry point, don't break at main
+
+# The manual half of picolab: what each tool step does and what every part of its
+# command line means. Used by --step (before running) and by `picolab explain` (instead
+# of running). Keep it in step with the commands the functions above really run.
+why_text() {
+    local B="$C_BOLD" X="$C_OFF" D="$C_DIM"
+    case "$1" in
+    configure) cat <<EOF
+   ${B}configure — cmake writes the build rules (once per project)${X}
+     cmake reads your CMakeLists.txt, finds the Pico SDK through PICO_SDK_PATH
+     (pico_sdk_import.cmake), picks the ARM cross-compiler arm-none-eabi-gcc,
+     and writes build rules into build/. Re-run only when CMakeLists.txt changes.
+       -S <dir>           the source folder: where CMakeLists.txt is
+       -B <dir>/build     generated files go here, never into your sources
+       -G Ninja           generate rules for the ninja build tool (fast; make also works)
+       -DPICO_BOARD=...   which board header the SDK uses: pins, flash size, the LED
+                          (only when PICO_BOARD is set; otherwise the project's default)
+     ${D}look: build/CMakeCache.txt holds every setting cmake decided${X}
+EOF
+    ;;
+    build) cat <<EOF
+   ${B}build — compile and link${X}
+     The build tool (ninja) recompiles each changed .c file into a .o object file with
+     arm-none-eabi-gcc, then the linker joins them with the SDK libraries into one
+     .elf: machine code placed at flash addresses, plus the debug symbols GDB uses.
+     picotool also turns the .elf into a .uf2 (the drag-and-drop BOOTSEL format).
+       --target <name>    build only this program from the project
+       -j<N>              run N compiles in parallel (one per CPU core)
+     ${D}look: ninja -C build -v   shows every real gcc / ld command line
+           arm-none-eabi-size build/<name>.elf   how much flash / RAM it uses${X}
+EOF
+    ;;
+    flash) cat <<EOF
+   ${B}flash — OpenOCD writes the program into the chip over SWD${X}
+     OpenOCD talks USB to the probe (the PicoGremlin); the probe talks SWD — two wires,
+     SWCLK + SWDIO — to the RP2350's debug port, which can halt the cores and read or
+     write any memory, including the flash.
+       -f interface/cmsis-dap.cfg   the probe speaks the CMSIS-DAP protocol
+       -f target/rp2350.cfg         what is at the other end: 2 cores, memory map, flash
+       -c "adapter speed N"         SWD clock in kHz
+       -c init -c "cmsis-dap quirk enable"   connect; one USB request at a time
+       -c "program F verify reset exit"      write F's sections into flash, read them
+                                    back and compare, reset the chip so it runs, quit
+     ${D}no probe? the same image goes over plain USB with picotool instead:
+         picotool load -f -x build/<name>.uf2   (reboot to bootloader, write, run)${X}
+EOF
+    ;;
+    flash-server) cat <<EOF
+   ${B}flash through the server — GDB asks the running OpenOCD to do it${X}
+     The OpenOCD in your other terminal is already connected to the chip. GDB connects
+     to it as a client and runs the script build/flash.gdb:
+       target extended-remote localhost:3333   connect to OpenOCD's GDB port
+       monitor reset halt     "monitor" passes a command to OpenOCD: reset, stop the core
+       load                   write the .elf's sections into flash (OpenOCD does the SWD)
+       monitor reset run      reset again and let the new program run
+       detach                 let go of the chip; the server keeps running
+EOF
+    ;;
+    debug) cat <<EOF
+   ${B}debug — GDB controls the running chip${X}
+     GDB reads the .elf for symbols (which address is which C line, function, variable)
+     and drives the chip through OpenOCD (the server on port 3333, or — without one — an
+     OpenOCD it starts itself over a pipe). The script build/debug.gdb loads the new
+     build, sets a breakpoint at main() and runs to it.
+       n / s      next line (step over) / step into the call
+       p x        print a variable        break f   stop when f is called
+       c          continue                Ctrl-C    stop wherever it is now
+       info registers   the CPU registers        x/4x 0x20000000   raw memory
+     Every one of these becomes SWD reads/writes of the chip's registers and memory.
+EOF
+    ;;
+    ocd) cat <<EOF
+   ${B}ocd — OpenOCD as a server${X}
+     Same connection as flashing (probe → SWD → RP2350), but OpenOCD stays running and
+     waits for clients instead of doing one job and quitting:
+       port 3333   GDB connects here (picolab flash / debug in the other terminal)
+       port 4444   a command line: telnet localhost 4444, then try: halt, reg pc, resume
+     "Examination succeed" = both cores answered over SWD.
+EOF
+    ;;
+    monitor) cat <<EOF
+   ${B}monitor — read the program's serial output${X}
+     printf in your program goes to UART0 (GP0 TX / GP1 RX) at 115200 baud. The probe
+     forwards those bytes over USB, where Linux shows them as /dev/ttyACM<n>.
+     serial-term.sh just sets the port up and prints what arrives:
+       stty -F <dev> 115200 raw -echo   115200 baud, bytes passed through unchanged
+       cat <dev>                        print them
+     ${D}same thing with a terminal program: picocom -b 115200 <dev>${X}
+EOF
+    ;;
+    esac
+}
+
+# `picolab explain [topic]`: the whole pipeline, with the real commands for the project
+# you are in (or a named lab target), without running anything.
+explain_cmd() {
+    local topic="${1:-all}" lab="<project>" t="<name>" elf ocd gdb s=()
+    case "$topic" in all|configure|build|flash|flash-server|debug|ocd|monitor) ;;
+        *) echo "!! no topic '$topic' — try: $ME explain [configure|build|flash|flash-server|debug|ocd|monitor]" >&2; exit 2 ;;
+    esac
+    if [ -n "$PROJ" ] || [ -n "${2:-}" ]; then
+        if (resolve_target "${2:-}") >/dev/null 2>&1; then resolve_target "${2:-}"; lab="$LAB"; t="$TARGET"; fi
+    fi
+    elf="$lab/build/$t.elf"
+    ocd="$(openocd_bin 2>/dev/null || echo openocd)"; gdb="$(gdb_bin 2>/dev/null || echo arm-none-eabi-gdb)"
+    mapfile -t s < <(ocd_scripts_arg)
+    echo "${C_BOLD}How picolab turns $( [ "$t" = "<name>" ] && echo "a project" || echo "$t" ) into a running, debuggable program${C_OFF}"
+    echo "   main.c ──configure──▶ build/ ──build──▶ $t.elf ──flash (SWD)──▶ RP2350 ──▶ monitor / debug"
+    [ "$lab" = "<project>" ] && echo "   ${C_DIM}(run it inside a project folder, or add a lab name, to see your real paths)${C_OFF}"
+    local STEP=0   # explaining, not running: show() must not pause
+    one() { echo; why_text "$1"; shift; show "$@"; }
+    case "$topic" in all|configure)    one configure cmake -S "$lab" -B "$lab/build" "${GEN_ARGS[@]}" ${PICO_BOARD:+-DPICO_BOARD=$PICO_BOARD} ;; esac
+    case "$topic" in all|build)        one build cmake --build "$lab/build" --target "$t" -j"$(nproc)" ;; esac
+    case "$topic" in all|flash)        one flash "$ocd" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET" -c "\"adapter speed $ADAPTER_SPEED\"" $OCD_QUIRK_SHOW -c "\"program $elf verify reset exit\"" ;; esac
+    case "$topic" in all|ocd)          one ocd "$ocd" "${s[@]}" -f "$OCD_IFACE" -f "$OCD_TARGET" -c "\"adapter speed $ADAPTER_SPEED\"" $OCD_QUIRK_SHOW ;; esac
+    case "$topic" in all|flash-server) one flash-server "$gdb" -q -batch "$elf" -x "$lab/build/flash.gdb" ;; esac
+    case "$topic" in all|debug)        one debug "$gdb" -q "$elf" -x "$lab/build/debug.gdb" ;; esac
+    local dev; dev="$(find_acm_by_pid 000c || find_acm_by_pid 0009 probe || echo "/dev/ttyACM<n>")"
+    case "$topic" in all|monitor)      one monitor "$HERE/serial-term.sh" "$dev" 115200 ;; esac
+    echo
+    echo "Run it yourself: copy any \$ line above. Or let picolab run it and stop at every step:"
+    echo "   ${C_CMD}$ME flash --step${C_OFF}    ${C_CMD}$ME debug --step${C_OFF}"
+}
+
+usage() {
+    cat <<EOF
+${C_BOLD}picolab${C_OFF} — build, flash, debug and watch a Pico program, showing every command it runs.
+
+${C_BOLD}First time${C_OFF}
+  ./picolab install           put picolab on your PATH (once, from tools/picolab/)
+  ./picolab install --tools --all --yes
+                              one shot, no prompts: link picolab + provision the whole
+                              toolchain (SDK, OpenOCD, FreeRTOS kernel, udev rule,
+                              PicoGremlin LA tools — picotool only when no probe is attached)
+  ./picolab install --tools   the same, but check first and ask before every fix
+  picolab doctor              check toolchain + board: ${C_OK}green${C_OFF} ok, ${C_ORANGE}orange${C_OFF} board not ready, ${C_ERR}red${C_OFF} fix this
+  picolab init my-project     make a new project folder with an empty main(), explained step by
+                              step (--step to pause; --blink adds the EP-0172 blink demo)
+  cd my-project && picolab flash --direct
+
+${C_BOLD}Every day${C_OFF}  (inside a project folder, or name a course lab: picolab flash l0_blink)
+  picolab build      cmake configures build/ once, then ninja compiles + links -> <name>.elf;
+                     ends with the file, its time and its flash/RAM size   (-v: every gcc/ld line)
+  picolab flash      1/2 build (only what changed), 2/2 OpenOCD writes the .elf into the
+                     RP2350's flash over SWD, verifies it, resets — your program starts
+                     (no debug probe? add --direct: upload straight to the chip over USB)
+  picolab debug      the same, then GDB stops at main(): next, step, print x, break f, continue
+
+  ${C_BOLD}Logic analyzer${C_OFF}  (the PicoGremlin's second job — 'picolab la <cmd>' runs picogremlin-la)
+  picolab la info               probe identity + capability lines
+  picolab la cap -c 14,15 -t 14 one-shot capture (GP16/GP17 = channels 14/15) -> CSV/VCD; --plot for a graph
+  picolab la stream -c 0-7      continuous stream for --seconds (rate, edges, CSV/VCD)
+  picolab la gui                Qt oscilloscope GUI (trigger, measurements, export)
+
+  ${C_BOLD}Debug views${C_OFF}  (plain GDB is the default; these show more without typing more)
+  picolab debug --tui           GDB's own split screen: your source follows each step
+  picolab debug --dashboard     source, variables, stack, registers redrawn at every stop
+  picolab dashboard             (in another terminal) give the dashboard a window of its own
+  picolab vscode                click-to-debug in VS Code, attached to your 'picolab ocd' server
+  picolab debug --debug-build   rebuild with -Og -g first: every variable visible, steps follow the source
+  picolab build <target> --release-build   select Release explicitly, including after a Debug session
+  picolab debug --no-break      load, then stay halted at the entry point: set your own
+                                breakpoints and 'c' to run (handy for asm / boot code)
+
+  ${C_BOLD}Choosing what gets flashed${C_OFF}  (for flash and debug alike)
+  picolab flash --no-build      the existing build as it is; says so if your sources are newer
+  picolab flash path/to/x.elf   exactly that file — nothing is built (.elf, .hex, .bin, .uf2)
+  picolab flash --direct        no debug probe? upload straight to the chip over plain USB
+                                with picotool instead of SWD (it reboots the board into its
+                                bootloader itself). Leave the flag off for the SWD path.
+                                (--uf2 / --picotool still work as aliases.)
+  picolab monitor    show the program's printf output (probe UART bridge by default;
+                     use 'picolab monitor usb' for USB-CDC-only firmware)
+  picolab <lab>      flash that course lab, then monitor (e.g. picolab l0_blink)
+
+${C_BOLD}Two terminals${C_OFF}  (recommended: see what OpenOCD does while you work)
+  terminal 1:  picolab ocd       OpenOCD stays connected to the chip; its log shows every
+                                 flash, GDB connection and error, live.  If a server is
+                                 already running it offers to replace it here (--force: do
+                                 it without asking)
+  terminal 2:  picolab flash / picolab debug   these find the server and go through it
+
+${C_BOLD}More${C_OFF}
+  picolab list          course lab targets it can find      picolab build-all   compile-check them all
+  picolab load x.elf    flash a prebuilt image, then monitor
+  picolab doctor --fix  offer each known fix, and ask before running it (builds/links picotool
+                        and OpenOCD too)
+  picolab upgrade [ver] opt in to a newer Pico SDK than the course pin (default: latest);
+                        --tools also refreshes picotool/OpenOCD. The pin stays the default.
+  picolab doctor --fix --yes    run every fix without asking (fresh machine / CI)
+  picolab doctor --fix --all    provision everything, probe or not: OpenOCD (Debug Probe),
+                                the FreeRTOS kernel and the PicoGremlin LA tools; picotool
+                                when no probe is attached (probe-free flashing — setup §5)
+  picolab install --tools --all --yes   one shot, no prompts: link picolab + whole toolchain
+  picolab help env      settings: PICO_SDK_PATH, ADAPTER_SPEED, SERIAL, ...
+
+${C_BOLD}Learn what it does${C_OFF}
+  picolab explain [topic]   the whole pipeline with YOUR project's real commands, every flag
+                            explained — runs nothing (topics: configure build flash debug ocd monitor)
+  picolab flash --step      do it for real, but stop before each tool command: explain it, ask, run
+                            (works with build, flash, debug, ocd, monitor, load)
+
+Every "\$ ..." line it prints is the real command: copy it and run it by hand any time.
+EOF
+}
+
+usage_env() {
+    cat <<EOF
+${C_BOLD}picolab settings${C_OFF} — environment variables (make one permanent: add the export line to ~/.bashrc)
+
+  PICO_SDK_PATH         REQUIRED to build: your Pico SDK checkout.
+                          export PICO_SDK_PATH=\$HOME/pico-sdk      (picolab doctor --fix can clone it)
+  FREERTOS_KERNEL_PATH  For the RTOS labs (AoES L5, EOS): a FreeRTOS-Kernel checkout, unless the
+                        course repo has lib/FreeRTOS-Kernel as a submodule. The course pins
+                        V11.3.1; picolab doctor reads include/task.h and fails on any other
+                        revision, because the firmware prints it and the images are compared
+                        against it.
+  FREERTOS_KERNEL_VERSION
+                        The revision picolab installs and requires (default: 11.3.1; a
+                        leading V is optional). Set it only when a lab genuinely pins a
+                        different kernel. doctor --fix installs into
+                        ~/.pico-sdk/freertos/FreeRTOS-Kernel-<version>, so two revisions
+                        can coexist, and the firmware prints whichever was used.
+  PICO_BOARD            Board type (default: pico2_w).
+  SERIAL                Serial device for monitor (default: auto-detect the probe's UART bridge).
+  ADAPTER_SPEED         SWD clock in kHz (default: 2000). Lower it (1000) if flashing fails with
+                        "CMSIS-DAP command mismatch"; raise it if your probe is happy.
+  CMSIS_DAP_QUIRK       1 (default) = one USB request to the probe at a time: slower, but the
+                        course probe firmware needs it. 0 = OpenOCD's faster pipelined mode.
+  PICOLAB_LABS          Colon-separated folders holding course labs (default: every src/<course>/
+                        in this repo that contains Pico projects).
+  PICOLAB_ENV           where install/upgrade record PICO_SDK_PATH etc.
+                        (default: ~/.config/picolab/env). picolab sources it automatically, so an
+                        upgrade applies on the NEXT picolab command — no shell restart.
+  PICOLAB_NO_ENV        1 = ignore that env file for a one-off run.
+  PICOLAB_SDK_VERSION   SDK release doctor --fix clones when there is none (default: $SDK_VERSION).
+  PICOLAB_PICOTOOL_VERSION  picotool release to build when no SDK says which (default: $PICOTOOL_VERSION).
+  PICOLAB_LA            Path to the 'la' CLI (the logic analyzer), if not on PATH or in
+                        ~/.local/share/picogremlin/venv.
+  PICOGREMLIN_LA_SRC    picogremlin-la checkout whose install.sh doctor --fix should run
+                        (default: a sibling checkout, else the published installer).
+  NO_COLOR=1            Plain output, no colours.
+
+Build-time #defines: trailing KEY=VAL args become -DKEY=VAL, e.g.
+  picolab flash l4_optimize START_MODE=1 LCD_MHZ=75
+EOF
+}
+
+# One dim line per step saying what is happening underneath — show() prints the
+# commands; this says what they DO, so the tool teaches instead of hiding.
+explain() { [ "$STEP" = 1 ] && return 0; printf '%s   what happens: %s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+
+# Split remaining args into KEY=VAL build overrides (forwarded as -D...) and
+# positional args, e.g.  picolab flash l4_optimize START_MODE=1 ENABLE_DBUF=0
+defs=(); pos=(); known="$(known_knobs)"
+for a in "$@"; do
+    case "$a" in
+        --no-build)   NOBUILD=1 ;;
+        --no-break)   NOBREAK=1 ;;
+        --direct|--uf2|--picotool) PROBE_FREE=1 ;;
+        --tools)      INSTALL_TOOLS=1 ;;
+        --bridge)     INSTALL_BRIDGE=1 ;;
+        --yes|-y)     YES=1 ;;
+        --all)        ALL=1 ;;
+        --force)      FORCE=1 ;;
+        --tui)        DEBUG_UI=tui ;;
+        --debug-build) export PICOLAB_BUILD_TYPE=Debug ;;
+        --release-build) export PICOLAB_BUILD_TYPE=Release ;;
+        --dashboard)  DEBUG_UI=dashboard ;;
+        -v|--verbose) VERBOSE=1 ;;
+        --step) if [ "$cmd" = init ] || [ "$cmd" = new ]; then pos+=("$a"); else STEP=1; fi ;;
+        *=*)
+            key="${a%%=*}"
+            if ! printf '%s\n' "$known" | grep -qx "$key"; then
+                echo "!! unknown build knob '$key' — likely a typo, so it will do NOTHING." >&2
+                echo "   Recognised knobs: $(printf '%s ' $known)" >&2
+            fi
+            defs+=("-D$a")
+            ;;
+        *)   pos+=("$a") ;;
+    esac
+done
+
+case "$cmd" in
+    list)         list_targets ;;
+    doctor|check) doctor "${pos[0]:-}" ;;
+    build)        build_target "${pos[0]:-}" ;;   # every lab at once is `build-all`, on purpose not the default
+    build-all)    build_all ;;
+    flash)        flash_target "${pos[0]:-}" ;;
+    load)         load_image "${pos[0]:-}" ;;
+    debug)        debug_target "${pos[0]:-}" ;;
+    monitor)      monitor "${pos[0]:-}" ;;
+    la)           la_cmd "${pos[@]}" ;;
+    ocd|server)   ocd_server ;;
+    init|new)     init_project "${pos[@]}" ;;
+    install)      install_cli "${pos[0]:-}" ;;
+    upgrade)      upgrade_cmd "${pos[0]:-}" ;;
+    uninstall)    uninstall_cli "${pos[0]:-}" ;;
+    explain)      explain_cmd "${pos[@]}" ;;
+    dashboard)    dashboard_term ;;
+    vscode|code)  vscode_setup ;;
+    ""|-h|--help|help) if [ "${pos[0]:-}" = env ]; then usage_env; else usage; fi ;;
+    *)            flash_target "$cmd"; monitor ;;   # e.g. $ME l4_optimize START_MODE=1
+esac
