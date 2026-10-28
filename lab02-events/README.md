@@ -9,23 +9,21 @@ control. Per-trial button statistics and wider classroom acceptance remain. It i
 
 | Target | Source | Purpose / controls |
 |---|---|---|
-| `aoes_lab02_timers` | `timers.c` | GP16 foreground, GP17 callback. Edit `timing_config.h` to choose the timing mode, workload and callback enable; rebuild and flash. `n` starts a fresh measurement window without changing settings. |
 | `aoes_lab02_events` | `events.c`, `race.c` | GP14/15 edge recorder, quiet-window filter, loss counters. `x` reproduces read/clear event loss and its repair. |
 | `aoes_lab02_rgb` | `rgb.c`, `waveform_exercise.c` | `r`, `g`, `b`, `w`, `o` select low-brightness colours. |
 | `aoes_lab02_irq` | `irq_experiment.c`, `waveform_exercise.c` | `f`, `e`, `u`, `m` select foreground, equal-priority, urgent, masked-frame experiments. |
 | `aoes_lab02_controller` | `events.c`, `led_app.c`, `waveform_exercise.c` | K1 cycles colour; K2 switches fade/steady. UART `b` runs one blocking-fade comparison. |
 | `aoes_lab02_atomics` | `atomics.c` | Advanced, controlled volatile/critical-section/atomic counter comparison. |
 
-Type a command character followed by Enter in the UART monitor. The CMake
-default first target is `aoes_lab02_timers`; use explicit names throughout.
+Type a command character followed by Enter in the UART monitor. Use explicit target names throughout.
 
 ## Get the student source
 
-The pinned source candidate is `aoes-lab02-v1.0.0-rc6` in the public
+The pinned source candidate is `aoes-lab02-v1.0.0-rc7` in the public
 `gsebik/aoes-labs` repository. The course manual is linked from the root README.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc6 \
+git clone --depth 1 --branch aoes-lab02-v1.0.0-rc7 \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .
@@ -41,47 +39,12 @@ export PICOLAB_BUILD_TYPE=Release
 Repeat that setting after opening a new terminal. The debugger's `--debug-build`
 selects Debug for that invocation; later normal builds return to Release.
 
-## Implement the timing versions
+## Timing experiments
 
-`timing_config.h` contains the experiment settings. `timers.c` contains five
-small TODOs; reporting, timestamps, work injection and GPIO initialization are
-provided. Replace each active `#error` with your implementation. Inactive modes
-are excluded by the preprocessor, so later TODOs do not block the first stage.
-
-| Stage | Configuration | Required implementation | Functional check |
-|---|---|---|---|
-| Relative wait | `LAB02_MODE_RELATIVE`, callback `0` | T1: one `sleep_ms` call using the requested millisecond interval | GP16 changes; IRQ count is zero. |
-| Absolute targets | `LAB02_MODE_ABSOLUTE`, callback `0` | T2: due comparison, including equality; T3: advance the previous microsecond target | Compare with relative timing under the same work. |
-| Timer interrupt | `LAB02_MODE_CPU_WORK`, callback `1` | T4: GP17 XOR operation; T5: checked repeating-timer registration using a negative millisecond interval | Both counts grow while the foreground calculation runs. |
-
-The detailed manual gives API signatures, variables, predictions and fault
-checks. Keep the supplied recorder unchanged when comparing these versions.
-`LAB02_FOREGROUND_WORK_US` selects the interruptible busy interval after each
-relative/absolute transition; CPU-work mode applies zero additional work.
-A relative wait is a duration; an absolute target is a clock timestamp.
-
-After implementing a stage, build and program its ELF:
-
-```sh
-picolab build aoes_lab02_timers
-picolab flash build/aoes_lab02_timers.elf
-picolab monitor
-```
-
-In the monitor type `n`, then Enter, to reset the measurement origin, counters
-and timer registration and print the settings. This command changes no settings.
-Close the monitor with Ctrl+C before rebuilding/programming. Retain separate
-captures and the corresponding source/configuration/ELF for each comparison.
-Changing the header without programming the rebuilt ELF does not change the board.
-
-For Task 2's five matched runs, keep `HALF_PERIOD_MS=500` and callback `1`:
-relative/0, absolute/0, relative/20000, absolute/20000 and CPU-work/0. Record at
-least one minute per run after its `window` header. The printed `mode=r/a/b`
-labels identify compiled modes; they are not UART selection commands.
-
-Other targets retain their input commands: for example `x` triggers the
-controlled race and `b` starts the controller's blocking-fade comparison.
-Specify the target and its ELF by name; never use an old ELF after a failed build.
+Tasks 1–2 are independent projects in `../lab02/01-relative/`,
+`../lab02/02-absolute/` and `../lab02/03-interrupt/`. Their timing statements
+are directly in each `main.c`; the manual gives the edits and comparisons.
+This directory contains the later event and waveform experiments.
 
 ## Sender exercise and recovery
 
@@ -112,14 +75,6 @@ Record the effective compiler flags and `clk_sys`; inspect the linked loop.
 
 ## Timing and ownership contracts
 
-- `timers.c [W]`: the same interruptible busy interval follows each foreground
-  toggle in `r` and `a`. `work_us` is the applied setting; `work_elapsed_us` is
-  the most recent observed call duration, including IRQ service. These are not
-  execution-demand bounds. `b` uses only its iteration loop and reports zero
-  extra workload. Edit/rebuild/flash to change mode or workload; `n` starts a fresh window with those compiled settings.
-- `timers.c [1/T4]`: SDK repeating-timer callback in IRQ context, not a thread. It is disabled until the student completes and enables T4/T5.
-  `[2]` dispatches the compiled foreground strategy; `[3]` snapshots count/timestamp
-  with local interrupts briefly masked. Startup registration adds a phase offset.
 - `events.c [1]`: one GPIO IRQ producer. Records and indices are volatile;
   the aligned 32-bit head publishes a completed slot. Main copies then releases
   through tail. Capacity is 255 records; full means discard newest and count it.
@@ -163,14 +118,13 @@ clock, compiler, placement or timing constants requires a fresh wire capture.
 The decoders use the Python standard library. Prepare the optional plotter once:
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r ../tools/lab02/requirements-plots.txt
+python3 -m venv ../lab02/.venv
+../lab02/.venv/bin/python -m pip install -r ../lab02/tools/requirements-plots.txt
 ```
 
-`analyze_timing.py` plots the five UART summary logs with `--json` and `--plot`.
-It selects the last announced window in each file, prints that choice and
-retains the source hash. It rejects malformed or inconsistent rows. Report-time
-points are observations, not a reconstruction of every transition.
+`../lab02/tools/analyze_timing.py` compares the individual timing projects'
+transition logs. It plots recorded intervals and phase error against the
+requested schedule, and retains source hashes in JSON output.
 
 `analyze_pins.py` reads the analyzer's `time_s,chN` CSV, draws actual sampled GPIO
 levels and reports complete transition intervals/full periods. `--pins 16 17`
@@ -198,7 +152,7 @@ before Ctrl+C. The monitor still accepts keyboard input through its stdin.
 The decoder ignores monitor banners and button/race messages.
 
 ```sh
-.venv/bin/python ../tools/lab02/analyze_edges.py captures/edges.log --pin 14 --gap-ms 50 --json captures/edges.json --plot captures/edges.png
+../lab02/.venv/bin/python ../lab02/tools/analyze_edges.py captures/edges.log --pin 14 --gap-ms 50 --json captures/edges.json --plot captures/edges.png
 ```
 
 The grouping gap is an analysis assumption. The JSON retains cluster endpoints,
@@ -213,7 +167,7 @@ Zero counters cannot prove the GPIO hardware observed every electrical edge.
 Record source/settings/ELF hash, SDK/compiler/clock, probe firmware and capture
 instrument resolution. Validate all of the following on the reference board:
 
-1. Matched foreground/callback timing windows and mode-reset behaviour.
+1. Matched timing runs from the three independent projects, including work and interval changes.
 2. Pin map, raw edges, quiet-gap statistics, overflow/ambiguity handling and
    per-trial debounce results. Never infer missed/double counts from totals alone.
 3. RGB channel order, pulse highs/lows/period and reset guard against the fitted
@@ -222,8 +176,8 @@ instrument resolution. Validate all of the following on the reference board:
 5. Controlled race results, safe ownership and the responsive/blocking comparison.
 6. Atomic object lock-free report and the linked implementation of both orders.
 
-The instructor walkthrough used this source on RP2350 with SDK 2.3.1/GCC 16.2.0:
-the timing comparisons, forced race/repair, RGB/IRQ captures, atomic counts and
+The earlier instructor walkthrough used RP2350 with SDK 2.3.1/GCC 16.2.0:
+the forced race/repair, RGB/IRQ captures, atomic counts and
 blocking-fade command were exercised. The user confirmed visible colour/fade control with the corrected zero pulse.
 Those checks do not replace the per-trial physical button tests or fitted-part
 identification above. Keep

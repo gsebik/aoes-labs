@@ -1,72 +1,56 @@
-# Lab 2 source candidate — aoes-lab02-v1.0.0-rc6
+# Lab 2 source candidate — aoes-lab02-v1.0.0-rc7
 
 Repository: https://github.com/gsebik/aoes-labs
 
-Clone this immutable tag and retain its commit (`git rev-parse HEAD`) with your
-measurements. This pack contains the Lab 2 starter, common helper, optional timing
-instrument, host analyzers. Use the existing station picolab installation. The course-site
-repository and private instructor completions are not dependencies.
+This tag is a review candidate. Retain its commit (`git rev-parse HEAD`), your
+source edits, build settings, ELF and raw observations together.
 
-## Build configuration
+## Timing projects
 
-- Target: Pico 2 W / RP2350 Arm/Core 0; EP-0172 pin map; UART0 via PicoGremlin.
-- Acceptance toolchain: Pico SDK 2.3.1; Arm GNU GCC 16.2.0 on the instructor host.
-- Measurement builds: Release. Instruction-dependent waveform translation units
-  additionally use O2, including Debug builds; this is explicit in CMakeLists.txt.
-- T1 is required for relative mode; T2/T3 for absolute mode; T4/T5 only when the
-  callback is enabled. W1/W2 are required by the normal waveform targets.
-- Separately named `_recovery` targets use the supplied recovery implementation.
-  Startup prints `sender=student` or `sender=recovery`; there is no cached switch.
+Tasks 1–2 use three independent projects under `lab02/`. Each has one `main.c`:
 
-After completing the selected timing TODOs, from `lab02-events/`:
+- `01-relative`: implement R1, the wait before the GPIO change.
+- `02-absolute`: implement A1, the due check, and A2, the target increment.
+- `03-interrupt`: reuse your A1/A2 and implement I1, timer registration.
+
+The supplied placeholders compile. Their observed behaviour helps identify
+unfinished timing statements. Follow the manual's functional checks.
+
+From the selected project directory, for example `lab02/01-relative/`:
 
 ```sh
 export PICOLAB_BUILD_TYPE=Release
-picolab build aoes_lab02_timers
-picolab flash build/aoes_lab02_timers.elf
+picolab build
+picolab flash build/aoes_lab02_relative.elf
 picolab monitor
 ```
 
-Set `export PICOLAB_BUILD_TYPE=Release` once in the lab terminal before these
-commands. The existing installed picolab understands this setting; no tool
-upgrade or bundled helper is required. Debug inspection uses the existing
-`--debug-build` option, and subsequent normal builds return to Release.
-`n` then Enter restarts the observation window; mode/workload/callback remain
-compiled settings in timing_config.h. Record one minute after the fresh header
-for each of r0, a0, r20, a20 and b0. Keep separate logs and ELFs.
+Use the matching ELF name for each project. Logs contain individual GP16
+transition records, the interval and work settings, and elapsed board time.
+The interrupt project also reports callback counts observed by main.
+Host analysis and plotting programs are in `lab02/tools/`.
 
-The first implementation, interval change, selected TODO errors, five matched
-configurations, completed waveform programs, recovery programs and Debug-to-Release
-switch are covered by build checks. Decoder tests cover malformed/inconsistent
-records and the distinction between toggle intervals and full periods.
+## Verification scope
 
-## Automated station checks
+All three timing starters and private completed versions compiled with Pico SDK
+2.3.1 and Arm GNU GCC 16.2.0, in Release configuration. The host test suite checks
+log validation, interval/phase calculations and pin decoding. These new direct
+programs still require a fresh board walkthrough; earlier timing-framework
+captures do not qualify these changed programs.
 
-The 2026-10-28 instructor walkthrough used this source on the reference station:
+The later experiments remain in `lab02-events/`. Earlier reference-station
+checks exercised deterministic race/repair, RGB pulse generation and IRQ
+interference, lock-free atomic counts and the blocking-fade comparison.
+The user confirmed visible colour/brightness control with the shorter-zero
+24-bit GRB sender. The final reference wire capture measured approximately
+320 ns zero HIGH and 640 ns one HIGH at 50 MS/s. Its fade uses 62.5 ms steps
+for an approximately two-second up/down cycle. Per-trial debounce statistics
+and wider classroom acceptance remain pending.
 
-- Relative/absolute first runs, 200 ms interval change and five matched timing
-  windows; each matched window retained at least one minute after a reset header.
-- Actual GP16/GP17 captures for relative/absolute 20 ms-work comparisons at 10 kS/s.
-- Deterministic read/clear loss and protected transfer, with their expected values.
-- GP12 RGB pulses and all four IRQ cases captured at 50 MS/s, with valid UART rows.
-- Lock-free atomic-counter comparison and the controller's blocking-fade command.
+Normal waveform targets require W1/W2 in `waveform_exercise.c`; separately
+named `_recovery` targets provide the supplied sender. Use the target and
+matching ELF explicitly.
 
-These are observations on the recorded configuration, not guaranteed timing
-bounds. Captures and private completed acceptance copies remain with the
-instructor, separately from this starter.
-
-## Hardware qualification boundary
-
-A source tag identifies code, not an unconditional timing guarantee. The
-instructor's dated bench record lists actual SWD/UART/analyzer checks separately
-from builds. The user confirmed colour and brightness control after shortening the zero
-pulse. The final 24-bit build was then checked at 50 MS/s: zero HIGH about 320 ns,
-one HIGH about 640 ns, complete LOW portions 640–980 ns. The fade now uses
-62.5 ms steps for an approximately two-second up/down cycle. Per-trial debounce
-statistics and a wider classroom walkthrough remain to be reviewed before this
-candidate becomes a qualified teaching release.
-
-The analyzer can show physical GP16/GP17 transitions, and high-rate captures can
-measure GP12 pulses subject to sample resolution and clock uncertainty. UART
-plots show report-time phase observations, not every edge or CPU execution.
-An observed maximum is not a WCET/WCRT bound. Debugger stops alter timing.
+A source tag identifies code, not a worst-case timing guarantee. UART timestamps
+are read after GPIO writes; callback counts are not callback timestamps. Physical
+pin captures have finite sampling resolution. Debugger stops alter timing.

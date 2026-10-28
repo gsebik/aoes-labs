@@ -7,7 +7,6 @@ pico_sdk_init()
 if(NOT PICO_RP2350 OR NOT PICO_PLATFORM MATCHES "arm")
     message(FATAL_ERROR "Lab 2 timing sources require the RP2350 Arm platform")
 endif()
-add_executable(aoes_lab02_timers timers.c board.c)
 add_executable(aoes_lab02_events events.c board.c race.c)
 add_executable(aoes_lab02_rgb rgb.c board.c waveform_exercise.c)
 add_executable(aoes_lab02_irq irq_experiment.c board.c waveform_exercise.c)
@@ -19,7 +18,7 @@ add_executable(aoes_lab02_irq_recovery irq_experiment.c board.c ws2812.c)
 add_executable(aoes_lab02_controller_recovery events.c board.c race.c led_app.c ws2812.c)
 target_compile_definitions(aoes_lab02_controller_recovery PRIVATE LAB_WITH_RGB=1)
 add_executable(aoes_lab02_atomics atomics.c board.c)
-foreach(target aoes_lab02_timers aoes_lab02_events aoes_lab02_rgb
+foreach(target aoes_lab02_events aoes_lab02_rgb
                aoes_lab02_irq aoes_lab02_controller aoes_lab02_atomics
                aoes_lab02_rgb_recovery aoes_lab02_irq_recovery
                aoes_lab02_controller_recovery)

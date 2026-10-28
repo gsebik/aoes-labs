@@ -73,3 +73,22 @@ class PinTests(unittest.TestCase):
         self.assertEqual(pins.channel(16),14)
         self.assertEqual(pins.channel(28),23)
         with self.assertRaises(ValueError): pins.channel(23)
+
+class DirectLEDLogTests(unittest.TestCase):
+    def test_relative_edges_give_interval_and_drift(self):
+        result=timing.analyze('led,relative,500,20,1,500000\nled,relative,500,20,2,1020000\n')
+        self.assertEqual(result['schema'],'aoes-led-transitions-v1')
+        self.assertEqual(result['summary']['main']['final_phase_us'],20000)
+    def test_callback_count_is_not_a_timestamp(self):
+        result=timing.analyze('led,interrupt,500,650,1,500000,1\nled,interrupt,500,650,2,1150000,2\n')
+        self.assertEqual(result['summary']['irq']['final_count'],2)
+        self.assertIsNone(result['summary']['irq']['final_phase_us'])
+    def test_bad_reset_or_changed_settings_are_rejected(self):
+        for data in ('led,relative,500,0,1,bad\n',
+                     'led,relative,500,0,2,1000000\nled,relative,500,0,1,500000\n',
+                     'led,relative,500,0,1,500000\nled,relative,500,20,2,1020000\n'):
+            with self.subTest(data=data),self.assertRaises(ValueError):timing.analyze(data)
+    def test_start_marker_excludes_stale_bridge_data(self):
+        result=timing.analyze('led,relative,500,0,9,4500000\nstart,absolute\nled,absolute,500,20,1,500001\n')
+        self.assertEqual(result['settings']['experiment'],'absolute')
+        self.assertEqual(len(result['rows']),1)
