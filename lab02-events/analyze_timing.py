@@ -78,22 +78,31 @@ def plot(reports, destination):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, layout="constrained")
+    busy = any(r["settings"]["mode"] == "b" for r in reports)
+    fig, axes = plt.subplots(3 if busy else 2, 1, figsize=(11, 9 if busy else 7),
+                             sharex=True, layout="constrained")
     for report in reports:
-        for ax, path in zip(axes, ("main", "irq")):
+        is_busy = report["settings"]["mode"] == "b"
+        foreground_ax = axes[1] if busy and is_busy else axes[0]
+        for ax, path, scale in ((foreground_ax, "main", 1000), (axes[-1], "irq", 1)):
             rows = [r for r in report["rows"] if r[path + "_count"]]
             if rows:
                 ax.plot([r["elapsed_us"] / 1e6 for r in rows],
-                        [r[path + "_phase_us"] / 1000 for r in rows],
+                        [r[path + "_phase_us"] / scale for r in rows],
                         ".-", linewidth=1, markersize=3, label=report["label"])
-    for ax, title in zip(axes, ("Foreground GP16", "Timer callback GP17")):
-        ax.set_title(title + " — recorded phase observations")
-        ax.set_ylabel("Phase error (ms)")
+    axes[0].set_title("GP16 — relative waits and absolute targets")
+    axes[0].set_ylabel("Phase error (ms)")
+    if busy:
+        axes[1].set_title("GP16 — uncalibrated CPU-work loop (separate scale)")
+        axes[1].set_ylabel("Phase error (ms)")
+    axes[-1].set_title("GP17 — timer-callback observations")
+    axes[-1].set_ylabel("Phase error (µs)")
+    for ax in axes:
         ax.grid(alpha=.2)
         if ax.lines:
             ax.legend(fontsize=8)
     axes[-1].set_xlabel("Elapsed time at UART report (s)")
-    fig.suptitle("Measured summaries; connecting lines do not reconstruct intervening transitions")
+    fig.suptitle("Recorded phase observations; lines do not reconstruct intervening edges", fontsize=11)
     fig.savefig(destination, dpi=160)
     plt.close(fig)
 

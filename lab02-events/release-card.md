@@ -1,4 +1,4 @@
-# Lab 2 source candidate — aoes-lab02-v1.0.0-rc3
+# Lab 2 source candidate — aoes-lab02-v1.0.0-rc4
 
 Repository: https://github.com/gsebik/aoes-labs
 

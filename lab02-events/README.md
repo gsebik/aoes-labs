@@ -21,11 +21,11 @@ default first target is `aoes_lab02_timers`; use explicit names throughout.
 
 ## Get the student source
 
-The pinned source candidate is `aoes-lab02-v1.0.0-rc3` in the public
+The pinned source candidate is `aoes-lab02-v1.0.0-rc4` in the public
 `gsebik/aoes-labs` repository. The course manual is linked from the root README.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc3 \
+git clone --depth 1 --branch aoes-lab02-v1.0.0-rc4 \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .

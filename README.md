@@ -10,7 +10,7 @@ Reference station: EP-0172 + Pico 2 W (RP2350 Arm/Core 0) + PicoGremlin, using
 SWD and UART0. Complete the manual's Environment Setup first.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc3 \
+git clone --depth 1 --branch aoes-lab02-v1.0.0-rc4 \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .
@@ -34,7 +34,7 @@ mistaking recovery work for a completed exercise.
 
 ## Reproducibility and status
 
-`aoes-lab02-v1.0.0-rc3` is a **review candidate**, not an unconditional hardware
+`aoes-lab02-v1.0.0-rc4` is a **review candidate**, not an unconditional hardware
 qualification. See `lab02-events/release-card.md` for the exact verification
 scope. Builds, actual station measurements and physical button/colour observations
 are distinct evidence. Never use illustrative manual numbers as board results.
