@@ -38,7 +38,8 @@ log validation, interval/phase calculations and pin decoding. These new direct
 programs still require a fresh board walkthrough; earlier timing-framework
 captures do not qualify these changed programs.
 
-The later experiments remain in `lab02-events/`. Earlier reference-station
+The later experiments are in `lab02/04-edges` … `08-atomics`, one directory per
+task (reorganised from `lab02-events/` on 2026-10-28). Earlier reference-station
 checks exercised deterministic race/repair, RGB pulse generation and IRQ
 interference, lock-free atomic counts and the blocking-fade comparison.
 The user confirmed visible colour/brightness control with the shorter-zero
@@ -54,3 +55,23 @@ matching ELF explicitly.
 A source tag identifies code, not a worst-case timing guarantee. UART timestamps
 are read after GPIO writes; callback counts are not callback timestamps. Physical
 pin captures have finite sampling resolution. Debugger stops alter timing.
+
+## Station walkthrough, 2026-10-28
+
+Fresh clone, every task as a student, EP-0172 + Pico 2 W + PicoGremlin, SDK 2.3.1,
+GCC 16.2.0, Release:
+
+- Tasks 1–2: median intervals 502.8 ms (relative, no work), 522.9 ms (relative,
+  20 ms work), 500.0 ms (absolute, both); with 650 ms of work GP16 changed every
+  653 ms and GP17 every 500 ms; the backtrace showed `alarm_pool_irq_handler`.
+- Tasks 3–4 (new `04-edges` layout): race demonstration `copied=1,remaining=0`
+  then `remaining=2`; the written ISR and debounce rule were exercised with
+  **simulated** presses (the button pin driven low over SWD, bursts about 0.5 ms
+  apart). Real contact bounce, per-trial debounce statistics and the multimeter-free
+  physical captures still need a person pressing the buttons.
+- Task 5: 320 ns zero highs, 640 ns one high, 960–980 ns lows at 50 MS/s.
+- Task 6: `f` one high stretched to about 2.0 µs, `e` intact with 422 µs service
+  delay, `u` one low stretched to about 1.8 µs, `m` intact with about 22 µs delay.
+- Task 7: colour and fade control and the blocking-fade comparison (about 1.6 s
+  handling delay) with simulated presses; the colours were not inspected by eye.
+- Extension: the atomic counts and `LDREX/STREX`, `LDAEX/STLEX` loops as described.

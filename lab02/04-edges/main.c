@@ -7,8 +7,6 @@
 #define RING_SIZE 256u
 _Static_assert((RING_SIZE & (RING_SIZE - 1u)) == 0 && RING_SIZE > 1,
                "RING_SIZE must be a power of two greater than one");
-// Initial trial setting only. Task 4 replaces it using the recorded edge clusters.
-#define DEBOUNCE_US 5000u
 
 typedef struct { uint64_t t_us; uint8_t pin, level; } edge_t;
 static volatile edge_t ring[RING_SIZE];
@@ -20,18 +18,13 @@ typedef struct {
 } button_t;
 static button_t buttons[2]; // Main-owned filter state.
 
-// [1] GPIO callback: SDK dispatch has acknowledged the delivered edge flags.
-static void edge_isr(uint pin, uint32_t events) {
-    if (pin != K1_PIN && pin != K2_PIN) return;
-    uint32_t both = GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL;
-    if ((events & both) == both) { ++ambiguous; return; }
-    uint32_t next = (head + 1u) & (RING_SIZE - 1u);
-    if (next == tail) { ++dropped; return; }
-    ring[head].t_us = time_us_64();
-    ring[head].pin = pin;
-    ring[head].level = (events & GPIO_IRQ_EDGE_RISE) != 0;
-    head = next; // Publish last. No overwrite until main releases the slot.
-}
+// [1] GPIO callback: the ISR side of the ring. The SDK has already
+// acknowledged the delivered edge flags before it calls edge_isr.
+#ifdef EDGE_ISR_REFERENCE
+#include "edge_reference.h"
+#else
+#include "edge_exercise.h"
+#endif
 
 static bool pop_edge(edge_t *e) {
     if (tail == head) return false;
@@ -55,19 +48,20 @@ static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
 #endif
 }
 
-// [2] Replay observed quiet gaps even if main drained the records late.
-static void filter_edge(const edge_t *e) {
-    button_t *b = &buttons[e->pin - K1_PIN];
-    if (b->pending && e->t_us - b->changed_us >= DEBOUNCE_US) {
-        accept_level(b, e->pin, b->changed_us + DEBOUNCE_US);
-    }
-    b->candidate = e->level;
-    b->changed_us = e->t_us;
-    b->pending = true;
-}
+// [2] Task 4: turn raw edges into presses (DEBOUNCE_US and filter_edge).
+#ifdef DEBOUNCE_REFERENCE
+#include "debounce_reference.h"
+#else
+#include "debounce_exercise.h"
+#endif
 
 int main(void) {
     lab_board_init("events", true);
+#ifdef EDGE_ISR_REFERENCE
+    puts("recorder=recovery");
+#else
+    puts("recorder=student");
+#endif
     for (uint i = 0; i < 2; ++i) {
         buttons[i].stable = buttons[i].candidate = gpio_get(K1_PIN + i);
     }

@@ -24,24 +24,26 @@ Keep source edits outside `build/`.
 
 | Directory | Contents |
 |---|---|
-| `lab02/01-relative/` | Relative wait directly in main's loop |
-| `lab02/02-absolute/` | Clock check and absolute-target update in main |
-| `lab02/03-interrupt/` | Foreground loop and SDK timer callback |
+| `lab02/01-relative/` … `03-interrupt/` | Tasks 1–2: timing in main and a timer callback |
+| `lab02/04-edges/` | Tasks 3–4: the button-edge recorder and your debounce rule |
+| `lab02/05-rgb/`, `06-irq/` | Tasks 5–6: your RGB sender, and interrupts against it |
+| `lab02/07-controller/` | Task 7: the controller built from your earlier code |
+| `lab02/08-atomics/` | Advanced extension |
+| `lab02/shared/` | Board setup and supplied reference versions |
 | `lab02/tools/` | PC-side UART/pin analysis, plotting dependencies and tests |
 | `lab02/captures/` | Create this directory for saved observations |
-| `lab02-events/` | Later button, shared-state, RGB and interrupt-interference experiments |
 | `common/` | Shared elapsed-cycle helper for later experiments |
 | `instruments/timing/` | Optional timing-instrument firmware |
 | `tools/timing/` | Decoder for that optional instrument |
 
-The waveform targets use the student exercise. Separately named `_recovery`
-programs let a group continue while discussing an unfinished sender with the
-lecturer; the startup banner identifies which executable is running.
+See `lab02/README.md` for the projects, targets and exercises. Separately named
+`_recovery` programs let a group continue while discussing an unfinished exercise
+with the lecturer; the startup banner identifies which executable is running.
 
 ## Reproducibility and status
 
 The current `main` is a **review candidate**, not an unconditional hardware
-qualification. See `lab02-events/release-card.md` for the exact verification
+qualification. See `lab02/release-card.md` for the exact verification
 scope. Builds, actual station measurements and physical button/colour observations
 are distinct evidence. Never use illustrative manual numbers as board results.
 

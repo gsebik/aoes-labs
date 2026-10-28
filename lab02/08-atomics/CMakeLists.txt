@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD pico2_w CACHE STRING "AoES reference board")
+include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(aoes_lab02_atomics C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+pico_sdk_init()
+if(NOT PICO_RP2350 OR NOT PICO_PLATFORM MATCHES "arm")
+    message(FATAL_ERROR "Lab 2 requires the RP2350 Arm platform")
+endif()
+set(SHARED ${CMAKE_CURRENT_LIST_DIR}/../shared)
+
+add_executable(aoes_lab02_atomics main.c ${SHARED}/board.c)
+
+foreach(target aoes_lab02_atomics)
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${SHARED})
+    target_link_libraries(${target} pico_stdlib hardware_timer hardware_irq
+                                  hardware_sync hardware_clocks)
+    target_compile_options(${target} PRIVATE -Wall -Wextra)
+    pico_enable_stdio_uart(${target} 1)
+    pico_enable_stdio_usb(${target} 0)
+    pico_add_extra_outputs(${target})
+endforeach()

@@ -4,7 +4,7 @@
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"
 #include "hardware/sync.h"
-#include "../common/timing.h"
+#include "../../common/timing.h"
 
 // Tasks 1–2 use GP16/17 as visible foreground/callback outputs.
 // Tasks 5–6 reuse those pins as IRQ-entry/frame measurement markers.
