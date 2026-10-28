@@ -10,11 +10,13 @@ Reference station: EP-0172 + Pico 2 W (RP2350 Arm/Core 0) + PicoGremlin, using
 SWD and UART0. Complete the manual's Environment Setup first.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc7 \
+git clone --depth 1 --branch main \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02/01-relative
 code .
 ```
+
+Record `git rev-parse HEAD` with your measurements to identify the source version.
 
 Each timing experiment has its own `main.c`. Follow the manual to implement
 its timing statements, build, program the board and compare the recorded output.

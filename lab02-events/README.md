@@ -19,15 +19,17 @@ Type a command character followed by Enter in the UART monitor. Use explicit tar
 
 ## Get the student source
 
-The pinned source candidate is `aoes-lab02-v1.0.0-rc7` in the public
+The current source is on `main` in the public
 `gsebik/aoes-labs` repository. The course manual is linked from the root README.
 
 ```sh
-git clone --depth 1 --branch aoes-lab02-v1.0.0-rc7 \
+git clone --depth 1 --branch main \
   https://github.com/gsebik/aoes-labs.git ~/aoes-labs
 cd ~/aoes-labs/lab02-events
 code .
 ```
+
+Record `git rev-parse HEAD` with your measurements to identify the source version.
 
 Keep `../common/` beside the project. No course-document checkout, RTOS or nested
 repository is required. Complete the course station setup first. Select Release once in the lab terminal:
