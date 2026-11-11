@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Read LED transition logs, calculate timing differences, and save comparison plots."""
+"""Read LED transition logs, calculate timing differences, and save comparison plots.
+
+Every capture is measured from its own first retained transition. The monitor
+usually starts after the program has already run, so absolute board time since
+boot depends on when you started recording. Relative time does not.
+"""
 import argparse
 import hashlib
 import json
@@ -41,13 +46,21 @@ def analyze(text):
                 raise ValueError("Callback count moved backwards")
             settings = current
             rows.append({"main_count": count, "elapsed_us": elapsed_us,
-                         "main_phase_us": elapsed_us - count * period_ms * 1000,
                          "irq_count": irq_count})
         except (IndexError, ValueError) as exc:
             raise ValueError(f"Line {number}: invalid LED record ({exc})") from exc
     if not rows:
         raise ValueError("No LED transitions: finish the timing statement and retain UART output")
-    phases = [r["main_phase_us"] for r in rows]
+
+    # Anchor every measurement at the first retained transition. Its board time
+    # and count are the zero of both axes, so the capture start cannot shift them.
+    anchor = rows[0]
+    period_us = settings["period_ms"] * 1000
+    for r in rows:
+        r["rel_elapsed_us"] = r["elapsed_us"] - anchor["elapsed_us"]
+        r["phase_us"] = (r["elapsed_us"] - anchor["elapsed_us"]) - (r["main_count"] - anchor["main_count"]) * period_us
+    phases = [r["phase_us"] for r in rows]
+
     # A gap in transition numbers means an interval was not completely recorded.
     intervals = [(b["elapsed_us"] - a["elapsed_us"])
                  for a, b in zip(rows, rows[1:])
@@ -56,14 +69,17 @@ def analyze(text):
                          "median_us": median(intervals), "max_us": max(intervals)}
                         if intervals else {"count": 0, "min_us": None,
                                            "median_us": None, "max_us": None})
-    return {"schema": "aoes-led-transitions-v1", "settings": settings, "rows": rows,
+    return {"schema": "aoes-led-transitions-v2", "settings": settings, "rows": rows,
+            "anchor": {"main_count": anchor["main_count"], "elapsed_us": anchor["elapsed_us"],
+                       "rule": "first retained transition is zero on both axes"},
             "windows_in_file": 1, "selected_window": 1,
-            "observation_end_us": rows[-1]["elapsed_us"],
-            "summary": {"interval": interval_summary, "main": {"final_count": rows[-1]["main_count"],
+            "observation_end_us": rows[-1]["rel_elapsed_us"],
+            "summary": {"interval": interval_summary, "main": {
+                "final_count": rows[-1]["main_count"],
                 "final_phase_us": phases[-1], "observed_min_phase_us": min(phases),
                 "observed_max_phase_us": max(phases)},
                 "irq": {"final_count": rows[-1]["irq_count"], "final_phase_us": None}},
-            "interpretation": "Main timestamps follow GP16 transitions. Timer counts have no per-IRQ timestamps; use pin captures for GP17 intervals."}
+            "interpretation": "Main timestamps follow GP16 transitions, measured from the first retained transition. Timer counts have no per-IRQ timestamps; use pin captures for GP17 intervals."}
 
 
 def plot(reports, destination):
@@ -75,10 +91,10 @@ def plot(reports, destination):
                              sharex=True, layout="constrained")
     for report in reports:
         rows = report["rows"]
-        xs = [r["elapsed_us"] / 1e6 for r in rows]
-        axes[0].plot(xs, [r["main_phase_us"]/1000 for r in rows], ".-", label=report["label"])
+        xs = [r["rel_elapsed_us"] / 1e6 for r in rows]
+        axes[0].plot(xs, [r["phase_us"]/1000 for r in rows], ".-", label=report["label"])
         pairs = [(a,b) for a,b in zip(rows, rows[1:]) if b["main_count"] == a["main_count"]+1]
-        axes[1].plot([b["elapsed_us"]/1e6 for a,b in pairs],
+        axes[1].plot([b["rel_elapsed_us"]/1e6 for a,b in pairs],
                      [(b["elapsed_us"]-a["elapsed_us"])/1000 for a,b in pairs],
                      ".-", label=report["label"])
         if has_irq and report["settings"]["experiment"] == "interrupt":
@@ -93,7 +109,7 @@ def plot(reports, destination):
     for ax in axes:
         ax.grid(alpha=.2)
         if ax.lines: ax.legend(fontsize=8)
-    axes[-1].set_xlabel("Elapsed board time (s)")
+    axes[-1].set_xlabel("Time since first recorded change (s)")
     fig.savefig(destination, dpi=160)
     plt.close(fig)
 

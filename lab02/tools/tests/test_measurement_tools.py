@@ -78,9 +78,14 @@ class PinTests(unittest.TestCase):
 class DirectLEDLogTests(unittest.TestCase):
     def test_relative_edges_give_interval_and_drift(self):
         result=timing.analyze('led,relative,500,20,1,500000\nled,relative,500,20,2,1020000\n')
-        self.assertEqual(result['schema'],'aoes-led-transitions-v1')
+        self.assertEqual(result['schema'],'aoes-led-transitions-v2')
         self.assertEqual(result['summary']['main']['final_phase_us'],20000)
         self.assertEqual(result['summary']['interval']['median_us'],520000)
+    def test_late_capture_gives_the_same_relative_phase(self):
+        boot=timing.analyze('led,relative,500,20,1,500000\nled,relative,500,20,2,1020000\nled,relative,500,20,3,1542000\n')
+        late=timing.analyze('led,relative,500,20,20,10400000\nled,relative,500,20,21,10920000\nled,relative,500,20,22,11442000\n')
+        self.assertEqual([r['phase_us'] for r in boot['rows']],[r['phase_us'] for r in late['rows']])
+        self.assertEqual([r['rel_elapsed_us'] for r in boot['rows']],[r['rel_elapsed_us'] for r in late['rows']])
     def test_callback_count_is_not_a_timestamp(self):
         result=timing.analyze('led,interrupt,500,650,1,500000,1\nled,interrupt,500,650,2,1150000,2\n')
         self.assertEqual(result['summary']['irq']['final_count'],2)

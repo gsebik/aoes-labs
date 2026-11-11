@@ -55,6 +55,19 @@ static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
 #include "debounce_exercise.h"
 #endif
 
+#ifdef EDGE_ISR_REFERENCE
+#define RECORDER_ID "supplied"
+#else
+#define RECORDER_ID "isr-exercise"
+#endif
+#ifdef DEBOUNCE_REFERENCE
+#define FILTER_ID "recovery"
+#else
+#define FILTER_ID "exercise"
+#endif
+// Printed with every status row: the banner is usually missed after a reset.
+#define BUILD_ID "build,recorder=" RECORDER_ID ",filter=" FILTER_ID
+
 int main(void) {
     lab_board_init("events", true);
 #ifdef EDGE_ISR_REFERENCE
@@ -127,6 +140,7 @@ int main(void) {
             printf("status,%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32
                    ",%" PRIu32 "\n", now, buttons[0].presses,
                    buttons[1].presses, lost, merged);
+            puts(BUILD_ID);
             next_status = now + 1000000;
         }
         sleep_us(100);
