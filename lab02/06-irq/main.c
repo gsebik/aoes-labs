@@ -86,9 +86,9 @@ int main(void) {
             printf("irq,case=%c,INVALID missed=%u complete=%u\n",
                    experiment, missed, complete);
         } else {
-            printf("irq,case=%c,requested_us=%" PRIu64 ",entry_us=%" PRIu64
-                   ",service_late_us=%" PRId64 ",bracket_start_us=%" PRIu64
-                   ",bracket_end_us=%" PRIu64 ",frame_cycles=%" PRIu32 "\n",
+            printf("irq,case=%c,requested_us=%llu,entry_us=%llu"
+                   ",service_late_us=%lld,bracket_start_us=%llu"
+                   ",bracket_end_us=%llu,frame_cycles=%lu\n",
                    experiment, requested, entry, (int64_t)(entry - requested),
                    frame.start_us, frame.end_us, frame.cycles);
         }

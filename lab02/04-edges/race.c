@@ -70,7 +70,7 @@ void lab_race_demo(void) {
     } else if (!completed || injection_timed_out) {
         puts("race,INVALID,reason=injected_irq_timeout");
     } else {
-        printf("race,copied=%" PRIu32 ",remaining=%" PRIu32 "\n",
+        printf("race,copied=%lu,remaining=%lu\n",
                copied, pending_events);
     }
 }

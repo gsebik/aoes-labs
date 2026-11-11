@@ -40,7 +40,7 @@ int main(void) {
         irq_set_pending(SPARE_IRQ_0);
         wait_for_irq();
         plain_counter = stale + 1u;
-        printf("counter,volatile,expected=2,observed=%" PRIu32 "\n", plain_counter);
+        printf("counter,volatile,expected=2,observed=%lu\n", plain_counter);
 
         plain_counter = 0;
         injected = false;
@@ -49,7 +49,7 @@ int main(void) {
         ++plain_counter;
         restore_interrupts(saved);
         wait_for_irq();
-        printf("counter,critical,expected=2,observed=%" PRIu32 "\n", plain_counter);
+        printf("counter,critical,expected=2,observed=%lu\n", plain_counter);
 
         use_atomic = true;
         atomic_store_explicit(&atomic_counter, 0, memory_order_relaxed);
@@ -57,10 +57,10 @@ int main(void) {
         irq_set_pending(SPARE_IRQ_0);
         increment_relaxed();
         wait_for_irq();
-        printf("counter,atomic,expected=2,observed=%" PRIu32 "\n",
+        printf("counter,atomic,expected=2,observed=%lu\n",
                atomic_load_explicit(&atomic_counter, memory_order_relaxed));
         increment_seq_cst(); // Keep both functions in the linked disassembly.
-        printf("counter,seq_cst_added,expected=3,observed=%" PRIu32 "\n",
+        printf("counter,seq_cst_added,expected=3,observed=%lu\n",
                atomic_load_explicit(&atomic_counter, memory_order_relaxed));
         sleep_ms(2000);
     }

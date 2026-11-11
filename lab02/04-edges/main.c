@@ -41,8 +41,8 @@ static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
     b->stable = b->candidate;
     if (!b->stable) ++b->presses;
     uint64_t handled = time_us_64();
-    printf("button,eligible_us=%" PRIu64 ",handled_us=%" PRIu64
-           ",pin=%u,pressed=%u\n", eligible_us, handled, pin, !b->stable);
+    printf("button,eligible_us=%llu,handled_us=%llu,pin=%u,pressed=%u\n",
+           eligible_us, handled, pin, !b->stable);
 #ifdef LAB_WITH_RGB
     if (!b->stable) led_app_press(pin, handled);
 #endif
@@ -101,7 +101,7 @@ int main(void) {
             uint i = edge.pin - K1_PIN;
             uint64_t delta = previous[i] ? edge.t_us - previous[i] : 0;
             previous[i] = edge.t_us;
-            printf("edge,%" PRIu64 ",%u,%u,%" PRIu64 "\n",
+            printf("edge,%llu,%u,%u,%llu\n",
                    edge.t_us, edge.pin, edge.level, delta);
             filter_edge(&edge);
         }
@@ -137,8 +137,7 @@ int main(void) {
             uint32_t saved = save_and_disable_interrupts();
             uint32_t lost = dropped, merged = ambiguous;
             restore_interrupts(saved);
-            printf("status,%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32
-                   ",%" PRIu32 "\n", now, buttons[0].presses,
+            printf("status,%llu,%lu,%lu,%lu,%lu\n", now, buttons[0].presses,
                    buttons[1].presses, lost, merged);
             puts(BUILD_ID);
             next_status = now + 1000000;

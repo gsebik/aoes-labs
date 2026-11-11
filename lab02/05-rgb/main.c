@@ -14,7 +14,7 @@ int main(void) {
         if (key == 'o') { r = 0; g = 0; b = 0; }
         ws2812_send_grb(g, r, b, true);
         ws2812_observation_t span = ws2812_last_observation();
-        printf("rgb,r=%u,g=%u,b=%u,frame_cycles=%" PRIu32 "\n", r, g, b, span.cycles);
+        printf("rgb,r=%u,g=%u,b=%u,frame_cycles=%lu\n", r, g, b, span.cycles);
         sleep_ms(500);
     }
 }
