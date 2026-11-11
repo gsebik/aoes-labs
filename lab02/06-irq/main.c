@@ -57,15 +57,17 @@ int main(void) {
         irq_set_priority(hardware_alarm_get_irq_num(fast_alarm),
                          experiment == 'e' ? 0xc0 : 0x40);
         printf("case=%c low_irq=%u low_priority=%u fast_irq=%u fast_priority=%u\n",
-               experiment, hardware_alarm_get_irq_num(slow_alarm),
+               experiment,
+               hardware_alarm_get_irq_num(slow_alarm),
                irq_get_priority(hardware_alarm_get_irq_num(slow_alarm)),
                hardware_alarm_get_irq_num(fast_alarm),
                irq_get_priority(hardware_alarm_get_irq_num(fast_alarm)));
         uint64_t start = time_us_64() + START_DELAY_US;
-        uint32_t fast_offset_us = experiment == 'f' ? FAST_OFFSET_FOREGROUND_US
-                                                    : FAST_OFFSET_IRQ_US;
+        uint32_t fast_offset_us =
+            experiment == 'f' ? FAST_OFFSET_FOREGROUND_US : FAST_OFFSET_IRQ_US;
         uint64_t requested = start + fast_offset_us;
-        bool missed = hardware_alarm_set_target(fast_alarm, from_us_since_boot(requested));
+        bool missed =
+            hardware_alarm_set_target(fast_alarm, from_us_since_boot(requested));
         if (experiment == 'f') {
             busy_wait_until(from_us_since_boot(start));
             ws2812_send_grb(FRAME_GREEN, FRAME_RED, FRAME_BLUE, false);
@@ -84,13 +86,20 @@ int main(void) {
         ws2812_observation_t frame = ws2812_last_observation();
         if (missed || !complete) {
             printf("irq,case=%c,INVALID missed=%u complete=%u\n",
-                   experiment, missed, complete);
+                   experiment,
+                   missed,
+                   complete);
         } else {
             printf("irq,case=%c,requested_us=%llu,entry_us=%llu"
                    ",service_late_us=%lld,bracket_start_us=%llu"
                    ",bracket_end_us=%llu,frame_cycles=%lu\n",
-                   experiment, requested, entry, (int64_t)(entry - requested),
-                   frame.start_us, frame.end_us, frame.cycles);
+                   experiment,
+                   requested,
+                   entry,
+                   (int64_t)(entry - requested),
+                   frame.start_us,
+                   frame.end_us,
+                   frame.cycles);
         }
         sleep_ms(1000);
     }

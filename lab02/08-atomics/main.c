@@ -16,20 +16,28 @@ __attribute__((noinline)) void increment_seq_cst(void) {
 }
 
 static void injected_isr(void) {
-    if (use_atomic) increment_relaxed();
-    else ++plain_counter;
+    if (use_atomic) {
+        increment_relaxed();
+    } else {
+        ++plain_counter;
+    }
     injected = true;
 }
 
 static void wait_for_irq(void) {
-    while (!injected) tight_loop_contents();
+    while (!injected) {
+        tight_loop_contents();
+    }
 }
 
 int main(void) {
     lab_board_init("atomics", false);
     bool lock_free = atomic_is_lock_free(&atomic_counter);
-    printf("atomic object_bytes=%u lock_free=%u\n", (uint)sizeof atomic_counter, lock_free);
-    if (!lock_free) panic("Atomic operation is not suitable for this ISR exercise");
+    printf(
+        "atomic object_bytes=%u lock_free=%u\n", (uint)sizeof atomic_counter, lock_free);
+    if (!lock_free) {
+        panic("Atomic operation is not suitable for this ISR exercise");
+    }
     irq_set_exclusive_handler(SPARE_IRQ_0, injected_isr);
     irq_set_enabled(SPARE_IRQ_0, true);
     while (true) {

@@ -8,14 +8,20 @@
 _Static_assert((RING_SIZE & (RING_SIZE - 1u)) == 0 && RING_SIZE > 1,
                "RING_SIZE must be a power of two greater than one");
 
-typedef struct { uint64_t t_us; uint8_t pin, level; } edge_t;
+typedef struct {
+    uint64_t t_us;
+    uint8_t pin, level;
+} edge_t;
+
 static volatile edge_t ring[RING_SIZE];
 static volatile uint32_t head, tail, dropped, ambiguous;
+
 typedef struct {
     uint64_t changed_us;
     bool candidate, stable, pending;
     uint32_t presses;
 } button_t;
+
 static button_t buttons[2]; // Main-owned filter state.
 
 // [1] Supplied GPIO recorder, or optional ISR-construction exercise. The SDK has already
@@ -27,7 +33,9 @@ static button_t buttons[2]; // Main-owned filter state.
 #endif
 
 static bool pop_edge(edge_t *e) {
-    if (tail == head) return false;
+    if (tail == head) {
+        return false;
+    }
     e->t_us = ring[tail].t_us;
     e->pin = ring[tail].pin;
     e->level = ring[tail].level;
@@ -37,14 +45,23 @@ static bool pop_edge(edge_t *e) {
 
 static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
     b->pending = false;
-    if (b->stable == b->candidate) return;
+    if (b->stable == b->candidate) {
+        return;
+    }
     b->stable = b->candidate;
-    if (!b->stable) ++b->presses;
+    if (!b->stable) {
+        ++b->presses;
+    }
     uint64_t handled = time_us_64();
     printf("button,eligible_us=%llu,handled_us=%llu,pin=%u,pressed=%u\n",
-           eligible_us, handled, pin, !b->stable);
+           eligible_us,
+           handled,
+           pin,
+           !b->stable);
 #ifdef LAB_WITH_RGB
-    if (!b->stable) led_app_press(pin, handled);
+    if (!b->stable) {
+        led_app_press(pin, handled);
+    }
 #endif
 }
 
@@ -87,10 +104,11 @@ int main(void) {
     led_app_init();
     puts("controller: K1=next colour K2=fade/steady; b=blocking fade comparison");
 #endif
-    puts("edge,t_us,pin,level,delta_us; status,t_us,k1_presses,k2_presses,dropped,ambiguous");
+    puts("edge,t_us,pin,level,delta_us; "
+         "status,t_us,k1_presses,k2_presses,dropped,ambiguous");
     puts("x=controlled read/clear race; no UART printing in the GPIO ISR");
-    gpio_set_irq_enabled_with_callback(K1_PIN,
-        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, edge_isr);
+    gpio_set_irq_enabled_with_callback(
+        K1_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, edge_isr);
     gpio_set_irq_enabled(K2_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
     uint64_t previous[2] = {0, 0};
     uint64_t next_status = time_us_64() + 1000000;
@@ -101,8 +119,7 @@ int main(void) {
             uint i = edge.pin - K1_PIN;
             uint64_t delta = previous[i] ? edge.t_us - previous[i] : 0;
             previous[i] = edge.t_us;
-            printf("edge,%llu,%u,%u,%llu\n",
-                   edge.t_us, edge.pin, edge.level, delta);
+            printf("edge,%llu,%u,%u,%llu\n", edge.t_us, edge.pin, edge.level, delta);
             filter_edge(&edge);
         }
         // Confirm only a history already drained by main. Keep the sample short;
@@ -115,8 +132,8 @@ int main(void) {
         for (uint i = 0; i < 2; ++i) {
             button_t *b = &buttons[i];
             bool level = (levels & (1u << (K1_PIN + i))) != 0;
-            if (caught_up && b->pending && now - b->changed_us >= DEBOUNCE_US
-                    && level == b->candidate) {
+            if (caught_up && b->pending && now - b->changed_us >= DEBOUNCE_US &&
+                level == b->candidate) {
                 accept_level(b, K1_PIN + i, b->changed_us + DEBOUNCE_US);
             }
         }
@@ -124,7 +141,9 @@ int main(void) {
         led_app_step(now);
 #endif
         int key = getchar_timeout_us(0);
-        if (key == 'x') lab_race_demo();
+        if (key == 'x') {
+            lab_race_demo();
+        }
 #ifdef LAB_WITH_RGB
         if (key == 'b') {
             puts("blocking fade begins; raw edges may queue while main waits");
@@ -137,8 +156,12 @@ int main(void) {
             uint32_t saved = save_and_disable_interrupts();
             uint32_t lost = dropped, merged = ambiguous;
             restore_interrupts(saved);
-            printf("status,%llu,%lu,%lu,%lu,%lu\n", now, buttons[0].presses,
-                   buttons[1].presses, lost, merged);
+            printf("status,%llu,%lu,%lu,%lu,%lu\n",
+                   now,
+                   buttons[0].presses,
+                   buttons[1].presses,
+                   lost,
+                   merged);
             puts(BUILD_ID);
             next_status = now + 1000000;
         }

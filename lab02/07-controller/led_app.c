@@ -4,7 +4,12 @@
 #define STEP_US 62500u // 32 steps form a two-second up/down cycle.
 #define PEAK 16u
 
-typedef enum { STEADY, RAMP_UP, RAMP_DOWN } colour_state_t;
+typedef enum {
+    STEADY,
+    RAMP_UP,
+    RAMP_DOWN
+} colour_state_t;
+
 // [A] Main owns all application state. No ISR reads or writes these fields.
 static colour_state_t state;
 static uint colour;
@@ -14,9 +19,15 @@ static bool dirty;
 
 static void send_colour(void) {
     uint8_t r = 0, g = 0, b = 0;
-    if (colour == 0 || colour == 3) r = brightness;
-    if (colour == 1 || colour == 3) g = brightness;
-    if (colour == 2 || colour == 3) b = brightness;
+    if (colour == 0 || colour == 3) {
+        r = brightness;
+    }
+    if (colour == 1 || colour == 3) {
+        g = brightness;
+    }
+    if (colour == 2 || colour == 3) {
+        b = brightness;
+    }
     ws2812_send_grb(g, r, b, true);
 }
 

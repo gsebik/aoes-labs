@@ -22,8 +22,8 @@ ws2812_observation_t ws2812_last_observation(void);
 
 // The sender body is included in the recovery and exercise translation units.
 // These helpers are inlined into its SRAM code; they do not run a flash loop.
-static inline __attribute__((always_inline)) void ws2812_wait_from(
-        uint32_t start, uint32_t duration) {
+static inline __attribute__((always_inline)) void ws2812_wait_from(uint32_t start,
+                                                                   uint32_t duration) {
     while ((uint32_t)(timing_read_cycles() - start) < duration) {
         __asm volatile("nop");
     }

@@ -22,7 +22,10 @@ int main(void) {
         uint64_t elapsed_us = time_us_64() - start_us;
         ++count;
         printf("led,relative,%u,%u,%u,%llu\n",
-               period_ms, work_ms, count, (unsigned long long)elapsed_us);
+               period_ms,
+               work_ms,
+               count,
+               (unsigned long long)elapsed_us);
         busy_wait_ms(work_ms);
     }
 }

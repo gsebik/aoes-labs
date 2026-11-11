@@ -38,8 +38,11 @@ int main(void) {
             uint64_t elapsed_us = time_us_64() - start_us;
             ++count;
             printf("led,interrupt,%u,%u,%u,%llu,%u\n",
-                   period_ms, work_ms, count,
-                   (unsigned long long)elapsed_us, timer_count);
+                   period_ms,
+                   work_ms,
+                   count,
+                   (unsigned long long)elapsed_us,
+                   timer_count);
 
             // TODO A2: copy your next_us increment from 02-absolute.
             busy_wait_ms(work_ms);

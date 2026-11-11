@@ -12,4 +12,3 @@ static void filter_edge(const edge_t *e) {
     b->changed_us = e->t_us;
     b->pending = true;
 }
-

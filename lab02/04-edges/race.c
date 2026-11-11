@@ -14,7 +14,9 @@ static void injected_isr(void) {
 static bool wait_for_injection(void) {
     uint64_t deadline = time_us_64() + 100000;
     while (!injected) {
-        if (time_us_64() >= deadline) return false;
+        if (time_us_64() >= deadline) {
+            return false;
+        }
         tight_loop_contents();
     }
     return true;
@@ -27,7 +29,9 @@ static void inject_between_accesses(void) {
     uint32_t state = save_and_disable_interrupts();
     irq_set_pending(SPARE_IRQ_0);
     restore_interrupts(state);
-    if ((state & 1u) == 0 && !wait_for_injection()) injection_timed_out = true;
+    if ((state & 1u) == 0 && !wait_for_injection()) {
+        injection_timed_out = true;
+    }
 }
 
 // [S] Task 3: repair this shared-word transfer. Keep the injected event in place.
@@ -70,7 +74,6 @@ void lab_race_demo(void) {
     } else if (!completed || injection_timed_out) {
         puts("race,INVALID,reason=injected_irq_timeout");
     } else {
-        printf("race,copied=%lu,remaining=%lu\n",
-               copied, pending_events);
+        printf("race,copied=%lu,remaining=%lu\n", copied, pending_events);
     }
 }

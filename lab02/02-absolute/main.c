@@ -23,7 +23,10 @@ int main(void) {
             uint64_t elapsed_us = time_us_64() - start_us;
             ++count;
             printf("led,absolute,%u,%u,%u,%llu\n",
-                   period_ms, work_ms, count, (unsigned long long)elapsed_us);
+                   period_ms,
+                   work_ms,
+                   count,
+                   (unsigned long long)elapsed_us);
 
             // TODO A2: advance next_us by one period_us here.
             busy_wait_ms(work_ms);
