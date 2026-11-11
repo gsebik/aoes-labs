@@ -10,15 +10,21 @@ _Static_assert((RING_SIZE & (RING_SIZE - 1u)) == 0 && RING_SIZE > 1,
 
 typedef struct {
     uint64_t t_us;
-    uint8_t pin, level;
+    uint8_t pin;
+    uint8_t level;
 } edge_t;
 
 static volatile edge_t ring[RING_SIZE];
-static volatile uint32_t head, tail, dropped, ambiguous;
+static volatile uint32_t head; // Written by the ISR.
+static volatile uint32_t tail; // Written by main.
+static volatile uint32_t dropped;
+static volatile uint32_t ambiguous;
 
 typedef struct {
     uint64_t changed_us;
-    bool candidate, stable, pending;
+    bool candidate;
+    bool stable;
+    bool pending;
     uint32_t presses;
 } button_t;
 
@@ -77,43 +83,59 @@ static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
 #else
 #define RECORDER_ID "isr-exercise"
 #endif
+
 #ifdef DEBOUNCE_REFERENCE
 #define FILTER_ID "recovery"
 #else
 #define FILTER_ID "exercise"
 #endif
+
 // Printed with every status row: the banner is usually missed after a reset.
 #define BUILD_ID "build,recorder=" RECORDER_ID ",filter=" FILTER_ID
 
+#define STATUS_PERIOD_US 1000000u
+
 int main(void) {
     lab_board_init("events", true);
+
 #ifdef EDGE_ISR_REFERENCE
     puts("recorder=supplied");
 #else
     puts("recorder=isr-exercise");
 #endif
+
 #ifdef DEBOUNCE_REFERENCE
     puts("filter=recovery");
 #else
     puts("filter=exercise");
 #endif
+
+    // Start each filter from the level the button has right now.
     for (uint i = 0; i < 2; ++i) {
-        buttons[i].stable = buttons[i].candidate = gpio_get(K1_PIN + i);
+        bool level = gpio_get(K1_PIN + i);
+        buttons[i].stable = level;
+        buttons[i].candidate = level;
     }
+
 #ifdef LAB_WITH_RGB
     led_app_init();
     puts("controller: K1=next colour K2=fade/steady; b=blocking fade comparison");
 #endif
+
     puts("edge,t_us,pin,level,delta_us; "
          "status,t_us,k1_presses,k2_presses,dropped,ambiguous");
     puts("x=controlled read/clear race; no UART printing in the GPIO ISR");
+
     gpio_set_irq_enabled_with_callback(
         K1_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, edge_isr);
     gpio_set_irq_enabled(K2_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+
     uint64_t previous[2] = {0, 0};
-    uint64_t next_status = time_us_64() + 1000000;
+    uint64_t next_status = time_us_64() + STATUS_PERIOD_US;
+
     while (true) {
         edge_t edge;
+
         // [3] The queue carries raw history; filters and colour state stay in main.
         while (pop_edge(&edge)) {
             uint i = edge.pin - K1_PIN;
@@ -122,6 +144,7 @@ int main(void) {
             printf("edge,%llu,%u,%u,%llu\n", edge.t_us, edge.pin, edge.level, delta);
             filter_edge(&edge);
         }
+
         // Confirm only a history already drained by main. Keep the sample short;
         // printing and application updates happen after restoring interrupts.
         uint32_t snapshot_state = save_and_disable_interrupts();
@@ -129,6 +152,7 @@ int main(void) {
         bool caught_up = head == tail;
         uint32_t levels = gpio_get_all();
         restore_interrupts(snapshot_state);
+
         for (uint i = 0; i < 2; ++i) {
             button_t *b = &buttons[i];
             bool level = (levels & (1u << (K1_PIN + i))) != 0;
@@ -137,13 +161,16 @@ int main(void) {
                 accept_level(b, K1_PIN + i, b->changed_us + DEBOUNCE_US);
             }
         }
+
 #ifdef LAB_WITH_RGB
         led_app_step(now);
 #endif
+
         int key = getchar_timeout_us(0);
         if (key == 'x') {
             lab_race_demo();
         }
+
 #ifdef LAB_WITH_RGB
         if (key == 'b') {
             puts("blocking fade begins; raw edges may queue while main waits");
@@ -151,11 +178,14 @@ int main(void) {
             puts("blocking fade ends");
         }
 #endif
+
         now = time_us_64();
         if (now >= next_status) {
             uint32_t saved = save_and_disable_interrupts();
-            uint32_t lost = dropped, merged = ambiguous;
+            uint32_t lost = dropped;
+            uint32_t merged = ambiguous;
             restore_interrupts(saved);
+
             printf("status,%llu,%lu,%lu,%lu,%lu\n",
                    now,
                    buttons[0].presses,
@@ -163,7 +193,7 @@ int main(void) {
                    lost,
                    merged);
             puts(BUILD_ID);
-            next_status = now + 1000000;
+            next_status = now + STATUS_PERIOD_US;
         }
         sleep_us(100);
     }

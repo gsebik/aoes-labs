@@ -97,3 +97,22 @@ Task 3 uses the normal `aoes_lab02_edges` with the initial pass-through filter:
 observe a press, diagnose and repair the shared-word transfer, then collect raw
 observations. Task 4 edits the filter. The optional `_isr_exercise` target uses
 `edge_exercise.h`; it is not a dependency of the controller.
+
+## Code style
+
+The sources follow one style so that each file reads the same way. `.clang-format` in
+the repository root holds the mechanical rules. Run it before you commit:
+
+```sh
+clang-format -i lab02/*/*.c lab02/*/*.h
+```
+
+Rules the formatter cannot check:
+
+- **One declaration per line.** Write `uint8_t red;` and `uint8_t green;`, not `uint8_t red, green;`.
+- **Blank lines separate steps.** Leave one between functions, and one between the setup, the loop and the reporting inside a long function.
+- **Braces on every `if` and loop**, even for a single statement.
+- **Name the numbers.** Put timing values, priorities and offsets in a named constant or `enum`, with a comment that says what the number means and its unit.
+- **Comments say why**, on their own line above the code. A bracketed marker such as `[W]` stays because the manual points at it.
+- **Short functions.** If `main` needs more than one screen, move each step into a small named function.
+- **Student files keep their `TODO` markers.** Keep each `#error "TODO …"` message on one line of at most 90 characters, and put longer instructions in a comment above it.

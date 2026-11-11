@@ -38,9 +38,12 @@ int main(void) {
     if (!lock_free) {
         panic("Atomic operation is not suitable for this ISR exercise");
     }
+
     irq_set_exclusive_handler(SPARE_IRQ_0, injected_isr);
     irq_set_enabled(SPARE_IRQ_0, true);
+
     while (true) {
+        // Case 1: a plain read-modify-write loses the ISR's increment.
         use_atomic = false;
         plain_counter = 0;
         injected = false;
@@ -50,6 +53,7 @@ int main(void) {
         plain_counter = stale + 1u;
         printf("counter,volatile,expected=2,observed=%lu\n", plain_counter);
 
+        // Case 2: masking interrupts around the update makes it a critical section.
         plain_counter = 0;
         injected = false;
         uint32_t saved = save_and_disable_interrupts();
@@ -59,6 +63,7 @@ int main(void) {
         wait_for_irq();
         printf("counter,critical,expected=2,observed=%lu\n", plain_counter);
 
+        // Case 3: one atomic read-modify-write, shared by main and the ISR.
         use_atomic = true;
         atomic_store_explicit(&atomic_counter, 0, memory_order_relaxed);
         injected = false;
@@ -67,9 +72,11 @@ int main(void) {
         wait_for_irq();
         printf("counter,atomic,expected=2,observed=%lu\n",
                atomic_load_explicit(&atomic_counter, memory_order_relaxed));
+
         increment_seq_cst(); // Keep both functions in the linked disassembly.
         printf("counter,seq_cst_added,expected=3,observed=%lu\n",
                atomic_load_explicit(&atomic_counter, memory_order_relaxed));
+
         sleep_ms(2000);
     }
 }
