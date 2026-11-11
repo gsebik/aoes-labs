@@ -7,6 +7,19 @@ static volatile bool slow_done, fast_done;
 static volatile uint64_t fast_entry_us;
 static char experiment = 'f';
 
+// The frame is dim red, so a damaged frame shows as a green tint. The fast alarm
+// is timed to land on a high pulse of a green-byte bit: a stretched zero pulse
+// then reads as a one. These offsets were tuned on the reference station at
+// 150 MHz and will move if the sender code or clock changes.
+enum {
+    FRAME_GREEN = 0x00,
+    FRAME_RED = 0x10,
+    FRAME_BLUE = 0x00,
+    START_DELAY_US = 500,
+    FAST_OFFSET_FOREGROUND_US = 2,
+    FAST_OFFSET_IRQ_US = 5,
+};
+
 // [H] Timestamp is after SDK IRQ dispatch. This measures service lateness.
 static void fast_cb(uint alarm) {
     (void)alarm;
@@ -19,7 +32,7 @@ static void fast_cb(uint alarm) {
 // [L] Candidate design: do a complete blocking LED update from an alarm IRQ.
 static void slow_cb(uint alarm) {
     (void)alarm;
-    ws2812_send_grb(0x05, 0x0a, 0x05, experiment == 'm');
+    ws2812_send_grb(FRAME_GREEN, FRAME_RED, FRAME_BLUE, experiment == 'm');
     slow_done = true;
 }
 
@@ -48,12 +61,14 @@ int main(void) {
                irq_get_priority(hardware_alarm_get_irq_num(slow_alarm)),
                hardware_alarm_get_irq_num(fast_alarm),
                irq_get_priority(hardware_alarm_get_irq_num(fast_alarm)));
-        uint64_t start = time_us_64() + 500;
-        uint64_t requested = start + 10;
+        uint64_t start = time_us_64() + START_DELAY_US;
+        uint32_t fast_offset_us = experiment == 'f' ? FAST_OFFSET_FOREGROUND_US
+                                                    : FAST_OFFSET_IRQ_US;
+        uint64_t requested = start + fast_offset_us;
         bool missed = hardware_alarm_set_target(fast_alarm, from_us_since_boot(requested));
         if (experiment == 'f') {
             busy_wait_until(from_us_since_boot(start));
-            ws2812_send_grb(0x05, 0x0a, 0x05, false);
+            ws2812_send_grb(FRAME_GREEN, FRAME_RED, FRAME_BLUE, false);
             slow_done = true;
         } else {
             missed |= hardware_alarm_set_target(slow_alarm, from_us_since_boot(start));
