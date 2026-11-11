@@ -4,7 +4,7 @@
  * EP-0172: GP16 user LED; GP26/ADC0 joystick; Gremlin UART0 console.
  * Collect one complete @@BEGIN ... @@END run. Output is outside each window.
  */
-#include <inttypes.h>
+#include "pri_compat.h"
 #include <math.h>
 #include <stdio.h>
 #include "pico/stdlib.h"

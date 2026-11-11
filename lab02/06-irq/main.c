@@ -119,9 +119,9 @@ static void report_trial(uint64_t requested_us, bool missed) {
         return;
     }
 
-    printf("irq,case=%c,requested_us=%llu,entry_us=%llu"
-           ",service_late_us=%lld,bracket_start_us=%llu"
-           ",bracket_end_us=%llu,frame_cycles=%lu\n",
+    printf("irq,case=%c,requested_us=%" PRIu64 ",entry_us=%" PRIu64 ""
+           ",service_late_us=%" PRId64 ",bracket_start_us=%" PRIu64 ""
+           ",bracket_end_us=%" PRIu64 ",frame_cycles=%" PRIu32 "\n",
            experiment,
            requested_us,
            entry_us,

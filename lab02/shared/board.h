@@ -1,5 +1,5 @@
 #pragma once
-#include <inttypes.h>
+#include "../../common/pri_compat.h"
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/clocks.h"

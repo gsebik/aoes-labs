@@ -59,7 +59,7 @@ static void accept_level(button_t *b, uint pin, uint64_t eligible_us) {
         ++b->presses;
     }
     uint64_t handled = time_us_64();
-    printf("button,eligible_us=%llu,handled_us=%llu,pin=%u,pressed=%u\n",
+    printf("button,eligible_us=%" PRIu64 ",handled_us=%" PRIu64 ",pin=%u,pressed=%u\n",
            eligible_us,
            handled,
            pin,
@@ -141,7 +141,11 @@ int main(void) {
             uint i = edge.pin - K1_PIN;
             uint64_t delta = previous[i] ? edge.t_us - previous[i] : 0;
             previous[i] = edge.t_us;
-            printf("edge,%llu,%u,%u,%llu\n", edge.t_us, edge.pin, edge.level, delta);
+            printf("edge,%" PRIu64 ",%u,%u,%" PRIu64 "\n",
+                   edge.t_us,
+                   edge.pin,
+                   edge.level,
+                   delta);
             filter_edge(&edge);
         }
 
@@ -186,7 +190,7 @@ int main(void) {
             uint32_t merged = ambiguous;
             restore_interrupts(saved);
 
-            printf("status,%llu,%lu,%lu,%lu,%lu\n",
+            printf("status,%" PRIu64 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
                    now,
                    buttons[0].presses,
                    buttons[1].presses,

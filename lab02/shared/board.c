@@ -21,7 +21,7 @@ void lab_board_init(const char *experiment, bool buttons) {
     }
 
     sleep_ms(1500); // Attach the Gremlin UART monitor after programming.
-    printf("lab02 experiment=%s clock_hz=%lu gcc=%s\n",
+    printf("lab02 experiment=%s clock_hz=%" PRIu32 " gcc=%s\n",
            experiment,
            clock_get_hz(clk_sys),
            __VERSION__);

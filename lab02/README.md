@@ -115,4 +115,6 @@ Rules the formatter cannot check:
 - **Name the numbers.** Put timing values, priorities and offsets in a named constant or `enum`, with a comment that says what the number means and its unit.
 - **Comments say why**, on their own line above the code. A bracketed marker such as `[W]` stays because the manual points at it.
 - **Short functions.** If `main` needs more than one screen, move each step into a small named function.
+- **Print fixed-width integers with the `PRI` macros** (`PRIu32`, `PRIu64`, `PRId64`), as in C99 and later. Include `common/pri_compat.h`, which defines them when the toolchain does not. Ubuntu 24.04's `gcc-arm-none-eabi` 13.2 uses GCC's own `<stdint.h>`, so newlib 4.4.0 omits them.
+- **Target C11 and the Ubuntu 24.04 toolchain.** Code must build there, and a newer compiler is fine once it does too.
 - **Student files keep their `TODO` markers.** Keep each `#error "TODO …"` message on one line of at most 90 characters, and put longer instructions in a comment above it.

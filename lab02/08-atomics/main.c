@@ -51,7 +51,7 @@ int main(void) {
         irq_set_pending(SPARE_IRQ_0);
         wait_for_irq();
         plain_counter = stale + 1u;
-        printf("counter,volatile,expected=2,observed=%lu\n", plain_counter);
+        printf("counter,volatile,expected=2,observed=%" PRIu32 "\n", plain_counter);
 
         // Case 2: masking interrupts around the update makes it a critical section.
         plain_counter = 0;
@@ -61,7 +61,7 @@ int main(void) {
         ++plain_counter;
         restore_interrupts(saved);
         wait_for_irq();
-        printf("counter,critical,expected=2,observed=%lu\n", plain_counter);
+        printf("counter,critical,expected=2,observed=%" PRIu32 "\n", plain_counter);
 
         // Case 3: one atomic read-modify-write, shared by main and the ISR.
         use_atomic = true;
@@ -70,11 +70,11 @@ int main(void) {
         irq_set_pending(SPARE_IRQ_0);
         increment_relaxed();
         wait_for_irq();
-        printf("counter,atomic,expected=2,observed=%lu\n",
+        printf("counter,atomic,expected=2,observed=%" PRIu32 "\n",
                atomic_load_explicit(&atomic_counter, memory_order_relaxed));
 
         increment_seq_cst(); // Keep both functions in the linked disassembly.
-        printf("counter,seq_cst_added,expected=3,observed=%lu\n",
+        printf("counter,seq_cst_added,expected=3,observed=%" PRIu32 "\n",
                atomic_load_explicit(&atomic_counter, memory_order_relaxed));
 
         sleep_ms(2000);
